@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Source tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/uv-home"
+          "${RUNNER_TEMP}/uv-home/bin/pip" install --disable-pip-version-check --no-cache-dir uv==0.12.5
+          export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP}/media-broker-python"
+          uv() { "${RUNNER_TEMP}/uv-home/bin/uv" "$@"; }
+          uv sync --locked --all-groups
+          uv run --locked --all-groups pytest -q
+          uv run --locked --all-groups ruff check .
+
+  publish:
+    name: Build and publish image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: |
+          docker build \
+            -t ghcr.io/mich-murphy/media-broker:main \
+            -t "ghcr.io/mich-murphy/media-broker:sha-${GITHUB_SHA::12}" \
+            .
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GITHUB_TOKEN}" | docker login ghcr.io -u mich-murphy --password-stdin
+      - name: Publish
+        run: |
+          docker push ghcr.io/mich-murphy/media-broker:main
+          docker push "ghcr.io/mich-murphy/media-broker:sha-${GITHUB_SHA::12}"

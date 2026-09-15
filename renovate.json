@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices", "customManagers:githubActionsVersions", ":rebaseStalePrs"],
+  "semanticCommits": "enabled",
+  "branchPrefix": "actions-renovate/",
+  "prHourlyLimit": 5,
+  "prConcurrentLimit": 5,
+  "branchConcurrentLimit": 5,
+  "rebaseWhen": "conflicted",
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "unresolved",
+  "major": {
+    "automerge": false
+  },
+  "packageRules": [
+    {
+      "description": "Digest, pin, and patch updates are low-risk; automerge everything else through review",
+      "matchUpdateTypes": ["digest", "pinDigest", "pin", "patch"],
+      "automerge": true
+    }
+  ]
+}

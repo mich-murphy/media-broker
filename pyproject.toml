@@ -1,0 +1,23 @@
+[project]
+name = "media-broker"
+version = "0.1.0"
+description = "Read-only MCP broker for local media services"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "httpx==0.28.1",
+    "mcp==1.28.1",
+]
+
+[project.scripts]
+media-broker = "media_broker.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.13.2",
+]
+
+[build-system]
+requires = ["uv_build==0.12.13"]
+build-backend = "uv_build"
