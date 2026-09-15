@@ -64,8 +64,9 @@ Run checks with `uv run --dev pytest` and `uv run --dev ruff check .`.
 
 CI builds the image on every merge to `main` and publishes it to GHCR as:
 
-- `ghcr.io/mich-murphy/media-broker:main` — rolling tag, digest-pinned by
-  Renovate in the home-infra Compose file.
+- `ghcr.io/mich-murphy/media-broker:main` — rolling tag. The home-infra
+  deployment tracks it unpinned; a timer on the Docker host pulls new digests
+  and redeploys automatically.
 - `ghcr.io/mich-murphy/media-broker:sha-<commit>` — immutable tag used for
   rollback and auditing.
 
