@@ -12,6 +12,16 @@
   "major": {
     "automerge": false
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "uv is pinned as a bare string in CI and the Dockerfile; no native manager sees it",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yaml$/", "/^Dockerfile$/"],
+      "matchStrings": ["uv==(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "uv"
+    }
+  ],
   "packageRules": [
     {
       "description": "Digest, pin, and patch updates are low-risk; automerge everything else through review",
