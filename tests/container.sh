@@ -28,16 +28,7 @@ backend="media-broker-backend-${suffix}"
 broker="media-broker-${suffix}"
 image="ghcr.io/mich-murphy/media-broker:test-${suffix}"
 base='python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea'
-ports=$(python3 - <<'PY'
-import socket
-sockets = []
-for _ in range(1):
-    sock = socket.socket(); sock.bind(("127.0.0.1", 0)); sockets.append(sock)
-print(sockets[0].getsockname()[1])
-for sock in sockets: sock.close()
-PY
-)
-read -r port <<<"${ports}"
+port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 fake_backend=$(mktemp)
 cleanup() {
   docker_cmd rm -f "${broker}" "${backend}" >/dev/null 2>&1 || true
@@ -161,8 +152,7 @@ for request_body in (
 ):
     status, text = request(json.dumps(request_body).encode(), "media_broker_token_fake_token_0123456789abcdef")
     assert status == 200, (status, text)
-    event = next(line[6:] for line in text.splitlines() if line.startswith("data: "))
-    result = json.loads(event)["result"]
+    result = json.loads(text)["result"]
     if request_body["method"] == "tools/list":
         assert {tool["name"] for tool in result["tools"]} == {
             "arr_library_inventory", "arr_quality_profiles", "arr_root_folders", "tautulli_play_history"

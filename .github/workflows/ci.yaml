@@ -15,20 +15,26 @@ concurrency:
 
 jobs:
   test:
-    name: Source tests
+    name: Quality gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Test
+      - name: Format, lint, type-check, test, audit
         run: |
           python3 -m venv "${RUNNER_TEMP}/uv-home"
           "${RUNNER_TEMP}/uv-home/bin/pip" install --disable-pip-version-check --no-cache-dir uv==0.12.5
           export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP}/media-broker-python"
           uv() { "${RUNNER_TEMP}/uv-home/bin/uv" "$@"; }
           uv sync --locked --all-groups
-          uv run --locked --all-groups pytest -q
-          uv run --locked --all-groups ruff check .
+          uv run --locked ruff format --check .
+          uv run --locked ruff check .
+          uv run --locked mypy
+          uv run --locked pytest -q
+          uv export --locked --no-dev --no-emit-project --no-hashes -o "${RUNNER_TEMP}/requirements.txt"
+          uv run --locked pip-audit --strict --disable-pip --no-deps -r "${RUNNER_TEMP}/requirements.txt"
+      - name: Build image
+        run: docker build .
 
   publish:
     name: Build and publish image
