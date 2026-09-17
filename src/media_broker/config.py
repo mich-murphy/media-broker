@@ -19,7 +19,7 @@ _UPSTREAM_API_VERSIONS = {
     "lidarr": "v1",
     "tautulli": "v2",
 }
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 _PUBLIC = "0.0.0.0"  # noqa: S104 - permitted only with an explicit opt-in flag
 
 
@@ -138,13 +138,20 @@ def _csv(
     return tuple(validate(name, value) for value in values)
 
 
+def _upstream(service: str, api_version: str) -> Upstream:
+    """Load one upstream's URL and secret-file key; inline keys are forbidden."""
+    env = service.upper()
+    if os.environ.get(f"{env}_API_KEY"):
+        raise ConfigError("upstream API keys must be configured with *_API_KEY_FILE")
+    return Upstream(
+        base_url=validate_endpoint(f"{env}_URL", _required(f"{env}_URL")),
+        api_key=_secret(f"{env}_API_KEY_FILE"),
+        api_version=api_version,
+    )
+
+
 def load_settings() -> Settings:
     """Load all required values from environment and explicitly named files."""
-    for service in _UPSTREAM_API_VERSIONS:
-        if os.environ.get(f"{service.upper()}_API_KEY"):
-            raise ConfigError(
-                "upstream API keys must be configured with *_API_KEY_FILE"
-            )
     bind_host = os.environ.get("MEDIA_BROKER_BIND_HOST", "127.0.0.1").strip()
     if bind_host not in _LOOPBACK | {_PUBLIC}:
         raise ConfigError("MEDIA_BROKER_BIND_HOST must be loopback or 0.0.0.0")
@@ -167,13 +174,7 @@ def load_settings() -> Settings:
     return Settings(
         bearer_token=bearer_token,
         upstreams={
-            service: Upstream(
-                base_url=validate_endpoint(
-                    f"{service.upper()}_URL", _required(f"{service.upper()}_URL")
-                ),
-                api_key=_secret(f"{service.upper()}_API_KEY_FILE"),
-                api_version=version,
-            )
+            service: _upstream(service, version)
             for service, version in _UPSTREAM_API_VERSIONS.items()
         },
         allowed_hosts=_csv(

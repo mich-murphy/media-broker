@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -564,18 +564,31 @@ def route_upstreams(request: httpx.Request) -> httpx.Response:
 
 
 class RecordingTransport(httpx.MockTransport):
-    closed = False
+    """A routed fake upstream that records requests and tracks closure."""
+
+    def __init__(self, handler: Handler) -> None:
+        super().__init__(handler)
+        self.requests: list[httpx.Request] = []
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return await super().handle_async_request(request)
 
     async def aclose(self) -> None:
         self.closed = True
 
 
 @pytest.fixture
-def mcp(settings: Settings) -> Any:
-    transport = RecordingTransport(route_upstreams)
-    with TestClient(build_app(settings, transport)) as client:
+def upstream() -> RecordingTransport:
+    return RecordingTransport(route_upstreams)
+
+
+@pytest.fixture
+def mcp(settings: Settings, upstream: RecordingTransport) -> Iterator[TestClient]:
+    with TestClient(build_app(settings, upstream)) as client:
         yield client
-    assert transport.closed, "upstream client must be closed when the server stops"
+    assert upstream.closed, "upstream client must be closed when the server stops"
 
 
 def rpc(
@@ -712,11 +725,16 @@ def test_each_tool_answers_over_streamable_http(
     ],
 )
 def test_out_of_bounds_arguments_are_rejected_before_any_upstream_call(
-    mcp: TestClient, name: str, arguments: dict[str, Any], field: str
+    mcp: TestClient,
+    upstream: RecordingTransport,
+    name: str,
+    arguments: dict[str, Any],
+    field: str,
 ) -> None:
     result = call_tool(mcp, name, **arguments)
     assert result["isError"] is True
     assert field in result["content"][0]["text"]
+    assert upstream.requests == []
 
 
 def test_unexpected_failures_are_reported_without_detail(settings: Settings) -> None:
