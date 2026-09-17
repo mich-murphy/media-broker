@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from datetime import date
 from typing import Any, Literal
 
@@ -15,6 +16,46 @@ TautulliMediaType = Literal["movie", "episode", "track"]
 
 _MAX_ITEMS = 10_000
 _INVENTORY_RESOURCE = {"sonarr": "series", "radarr": "movie", "lidarr": "artist"}
+# Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
+_WATCHED_STATUSES = frozenset({0, 0.25, 0.5, 0.75, 1})
+
+# A projection maps each output key to its upstream source key and the JSON
+# scalar types it must match; anything else projects to None.
+_Fields = Mapping[str, tuple[str, *tuple[type, ...]]]
+
+_ARR_ITEM: _Fields = {
+    "id": ("id", int),
+    "title": ("title", str),
+    "year": ("year", int),
+    "status": ("status", str),
+    "monitored": ("monitored", bool),
+    "quality_profile_id": ("qualityProfileId", int),
+    "root_folder_path": ("rootFolderPath", str),
+}
+_QUALITY_PROFILE: _Fields = {
+    "id": ("id", int),
+    "name": ("name", str),
+    "upgrade_allowed": ("upgradeAllowed", bool),
+    "cutoff": ("cutoff", int),
+}
+_ROOT_FOLDER: _Fields = {
+    "id": ("id", int),
+    "path": ("path", str),
+    "accessible": ("accessible", bool),
+    "free_space_bytes": ("freeSpace", int),
+    "total_space_bytes": ("totalSpace", int),
+}
+# The source-prefixed identifiers are approved for household matching.
+_HISTORY_ITEM: _Fields = {
+    "tautulli_user_id": ("user_id", int, str),
+    "tautulli_rating_key": ("rating_key", int, str),
+    "tautulli_history_id": ("id", int, str),
+    "title": ("title", str),
+    "parent_title": ("parent_title", str),
+    "grandparent_title": ("grandparent_title", str),
+    "played_at": ("started", int, float),
+    "duration_seconds": ("duration", int, float),
+}
 
 
 class UpstreamError(RuntimeError):
@@ -95,8 +136,12 @@ class MediaClient:
     async def inventory(
         self, service: ArrService, page: int, page_size: int, search: str | None = None
     ) -> dict[str, Any]:
-        resource = _INVENTORY_RESOURCE[service]
-        items = [_project_arr_item(i) for i in await self._arr_items(service, resource)]
+        rows = await self._arr_items(service, _INVENTORY_RESOURCE[service])
+        items = [
+            # Lidarr names its title field artistName; fold it into title first.
+            _project({**r, "title": r.get("title") or r.get("artistName")}, _ARR_ITEM)
+            for r in rows
+        ]
         if query := (search or "").strip().casefold():
             items = [i for i in items if query in (i["title"] or "").casefold()]
         start = (page - 1) * page_size
@@ -115,15 +160,17 @@ class MediaClient:
             },
         }
 
+    async def _summaries(
+        self, service: ArrService, resource: str, fields: _Fields
+    ) -> dict[str, Any]:
+        rows = [_project(r, fields) for r in await self._arr_items(service, resource)]
+        return {"service": service, "items": rows, "upstream_truncated": False}
+
     async def quality_profiles(self, service: ArrService) -> dict[str, Any]:
-        payload = await self._arr_items(service, "qualityprofile")
-        items = [_project_quality_profile(item) for item in payload]
-        return {"service": service, "items": items, "upstream_truncated": False}
+        return await self._summaries(service, "qualityprofile", _QUALITY_PROFILE)
 
     async def root_folders(self, service: ArrService) -> dict[str, Any]:
-        payload = await self._arr_items(service, "rootfolder")
-        items = [_project_root_folder(item) for item in payload]
-        return {"service": service, "items": items, "upstream_truncated": False}
+        return await self._summaries(service, "rootfolder", _ROOT_FOLDER)
 
     async def history(
         self,
@@ -157,7 +204,11 @@ class MediaClient:
         # Re-apply the requested filters locally so a misbehaving upstream
         # can never return another household member's rows.
         items = [
-            _project_history_item(row, media_type)
+            {
+                "media_type": media_type,
+                **_project(row, _HISTORY_ITEM),
+                "completed": _completion(row.get("watched_status")),
+            }
             for row in rows
             if row.get("media_type", media_type) == media_type
             and (user_id is None or row.get("user_id") in (user_id, str(user_id)))
@@ -203,12 +254,16 @@ def _history_page(
     if not isinstance(response, dict) or response.get("result") != "success":
         raise UpstreamError("upstream history request was not successful")
     data = response.get("data")
-    if not isinstance(data, dict) or not isinstance(rows := data.get("data"), list):
+    if (
+        not isinstance(data, dict)
+        or not isinstance(rows := data.get("data"), list)
+        or len(rows) > page_size
+    ):
         raise UpstreamError("upstream returned an unexpected history response")
-    if len(rows) > page_size:
-        raise UpstreamError("upstream returned an unexpected history response")
-    dict_rows = [row for row in rows if isinstance(row, dict)]
-    return dict_rows, _scalar(data.get("recordsFiltered"), int)
+    return (
+        [row for row in rows if isinstance(row, dict)],
+        _scalar(data.get("recordsFiltered"), int),
+    )
 
 
 def _scalar(value: Any, *types: type) -> Any:
@@ -218,54 +273,11 @@ def _scalar(value: Any, *types: type) -> Any:
     return value if isinstance(value, types) else None
 
 
-def _project_arr_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _scalar(item.get("id"), int),
-        "title": _scalar(item.get("title") or item.get("artistName"), str),
-        "year": _scalar(item.get("year"), int),
-        "status": _scalar(item.get("status"), str),
-        "monitored": _scalar(item.get("monitored"), bool),
-        "quality_profile_id": _scalar(item.get("qualityProfileId"), int),
-        "root_folder_path": _scalar(item.get("rootFolderPath"), str),
-    }
-
-
-def _project_quality_profile(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _scalar(item.get("id"), int),
-        "name": _scalar(item.get("name"), str),
-        "upgrade_allowed": _scalar(item.get("upgradeAllowed"), bool),
-        "cutoff": _scalar(item.get("cutoff"), int),
-    }
-
-
-def _project_root_folder(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": _scalar(item.get("id"), int),
-        "path": _scalar(item.get("path"), str),
-        "accessible": _scalar(item.get("accessible"), bool),
-        "free_space_bytes": _scalar(item.get("freeSpace"), int),
-        "total_space_bytes": _scalar(item.get("totalSpace"), int),
-    }
+def _project(row: Mapping[str, Any], fields: _Fields) -> dict[str, Any]:
+    """Project one upstream row to the allowed keys and scalar types only."""
+    return {name: _scalar(row.get(spec[0]), *spec[1:]) for name, spec in fields.items()}
 
 
 def _completion(value: Any) -> bool | None:
-    # Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
     status = _scalar(value, int, float)
-    return None if status not in (0, 0.25, 0.5, 0.75, 1) else status == 1
-
-
-def _project_history_item(item: dict[str, Any], media_type: str) -> dict[str, Any]:
-    # The source-prefixed identifiers are approved for household matching.
-    return {
-        "media_type": media_type,
-        "tautulli_user_id": _scalar(item.get("user_id"), int, str),
-        "tautulli_rating_key": _scalar(item.get("rating_key"), int, str),
-        "tautulli_history_id": _scalar(item.get("id"), int, str),
-        "title": _scalar(item.get("title"), str),
-        "parent_title": _scalar(item.get("parent_title"), str),
-        "grandparent_title": _scalar(item.get("grandparent_title"), str),
-        "played_at": _scalar(item.get("started"), int, float),
-        "duration_seconds": _scalar(item.get("duration"), int, float),
-        "completed": _completion(item.get("watched_status")),
-    }
+    return None if status not in _WATCHED_STATUSES else status == 1
