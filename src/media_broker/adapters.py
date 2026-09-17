@@ -3,8 +3,9 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Literal
 
 import httpx
@@ -13,8 +14,12 @@ from .config import Settings, Upstream
 
 ArrService = Literal["sonarr", "radarr", "lidarr"]
 TautulliMediaType = Literal["movie", "episode", "track"]
+JellyfinMediaType = Literal["movie", "episode", "track"]
 
 _MAX_ITEMS = 10_000
+_MAX_PROJECTED_STRING = 1024
+_JELLYFIN_FILTERS = {"movie": "Movie", "episode": "Episode", "track": "Audio"}
+_JELLYFIN_USER_ID = re.compile(r"^[0-9a-fA-F]{32}$")
 _INVENTORY_RESOURCE = {"sonarr": "series", "radarr": "movie", "lidarr": "artist"}
 # Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
 _WATCHED_STATUSES = frozenset({0, 0.25, 0.5, 0.75, 1})
@@ -56,6 +61,12 @@ _HISTORY_ITEM: _Fields = {
     "played_at": ("started", int, float),
     "duration_seconds": ("duration", int, float),
 }
+_JELLYFIN_HISTORY_ITEM: _Fields = {
+    "jellyfin_item_id": ("Id", int, str),
+    "jellyfin_history_id": ("RowId", int, str),
+    "title": ("Name", str),
+    "duration_seconds": ("Duration", int, float),
+}
 
 
 class UpstreamError(RuntimeError):
@@ -79,7 +90,7 @@ async def _bounded_body(response: httpx.Response, maximum: int) -> bytes:
 
 
 class MediaClient:
-    """HTTP client for the four allow-listed upstream APIs."""
+    """HTTP client for the five allow-listed upstream APIs."""
 
     def __init__(
         self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
@@ -102,7 +113,11 @@ class MediaClient:
     async def _json(
         self, upstream: Upstream, path: str, params: dict[str, Any] | None = None
     ) -> Any:
-        headers = {"X-Api-Key": upstream.api_key}
+        headers = (
+            {"X-Emby-Token": upstream.api_key}
+            if upstream is self.settings.upstreams.get("jellyfin")
+            else {"X-Api-Key": upstream.api_key}
+        )
         try:
             async with (
                 asyncio.timeout(self.settings.timeout_seconds),
@@ -233,6 +248,98 @@ class MediaClient:
             },
         }
 
+    async def jellyfin_history(
+        self,
+        user_id: str,
+        media_type: JellyfinMediaType,
+        start_date: str,
+        end_date: str,
+        page: int,
+        page_size: int,
+        timezone_offset: float,
+    ) -> dict[str, Any]:
+        """Return projected Playback Reporting rows, fetched one day at a time."""
+        start, end = _date_range(start_date, end_date)
+        if not _JELLYFIN_USER_ID.fullmatch(user_id):
+            raise ParameterError("user_id must contain exactly 32 hex characters")
+        if not -14 <= timezone_offset <= 14:
+            raise ParameterError("timezone_offset must be between -14 and 14 hours")
+
+        upstream = self.settings.upstreams["jellyfin"]
+        offset = (page - 1) * page_size
+        items: list[dict[str, Any]] = []
+        total_count = 0
+        current = start
+        while current <= end:
+            payload = await self._json(
+                upstream,
+                f"/user_usage_stats/{user_id}/{current.isoformat()}/GetItems",
+                {
+                    "filter": _JELLYFIN_FILTERS[media_type],
+                    "timezoneOffset": timezone_offset,
+                },
+            )
+            if not isinstance(payload, list) or any(
+                not isinstance(row, dict) for row in payload
+            ):
+                raise UpstreamError(
+                    "upstream returned an unexpected Jellyfin history response"
+                )
+            # Count every row for honest local pagination, but retain only the
+            # requested page and project it before the day's payload is dropped.
+            for row in payload:
+                if offset <= total_count < offset + page_size:
+                    items.append(_jellyfin_project(user_id, media_type, current, row))
+                total_count += 1
+                if total_count > _MAX_ITEMS:
+                    raise UpstreamError(
+                        "upstream returned too many Jellyfin history rows"
+                    )
+            del payload
+            current += timedelta(days=1)
+
+        page_items = items
+        return {
+            "jellyfin_user_id": user_id,
+            "media_type": media_type,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "timezone_offset": timezone_offset,
+            "items": page_items,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "returned_count": len(page_items),
+                "total_count": total_count,
+                "has_more": offset + len(page_items) < total_count,
+                "upstream_paginated": False,
+                "upstream_truncated": False,
+            },
+        }
+
+
+def _jellyfin_project(
+    user_id: str,
+    media_type: JellyfinMediaType,
+    local_date: date,
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "jellyfin_user_id": user_id,
+        "media_type": media_type,
+        "played_at": _jellyfin_played_at(local_date, row.get("Time")),
+        **_project_bounded(row, _JELLYFIN_HISTORY_ITEM),
+    }
+
+
+def _jellyfin_played_at(local_date: date, value: Any) -> str | None:
+    """Combine a plugin local time with its requested local calendar date."""
+    time = _bounded_scalar(value, str)
+    if time is None:
+        return None
+    played_at = f"{local_date.isoformat()}T{time}"
+    return played_at if len(played_at) <= _MAX_PROJECTED_STRING else None
+
 
 def _date_range(start_value: str, end_value: str) -> tuple[date, date]:
     try:
@@ -276,6 +383,20 @@ def _scalar(value: Any, *types: type) -> Any:
 def _project(row: Mapping[str, Any], fields: _Fields) -> dict[str, Any]:
     """Project one upstream row to the allowed keys and scalar types only."""
     return {name: _scalar(row.get(spec[0]), *spec[1:]) for name, spec in fields.items()}
+
+
+def _bounded_scalar(value: Any, *types: type) -> Any:
+    scalar = _scalar(value, *types)
+    if isinstance(scalar, str) and len(scalar) > _MAX_PROJECTED_STRING:
+        return None
+    return scalar
+
+
+def _project_bounded(row: Mapping[str, Any], fields: _Fields) -> dict[str, Any]:
+    return {
+        name: _bounded_scalar(row.get(spec[0]), *spec[1:])
+        for name, spec in fields.items()
+    }
 
 
 def _completion(value: Any) -> bool | None:

@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .adapters import (
     ArrService,
+    JellyfinMediaType,
     MediaClient,
     ParameterError,
     TautulliMediaType,
@@ -32,6 +33,8 @@ PageSize = Annotated[int, Field(ge=1, le=100)]
 Search = Annotated[str | None, Field(max_length=200)]
 IsoDate = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
 UserId = Annotated[int | None, Field(ge=0, le=2_147_483_647)]
+JellyfinUserId = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{32}$")]
+TimezoneOffset = Annotated[float, Field(ge=-14, le=14)]
 
 
 class BearerMiddleware:
@@ -121,6 +124,29 @@ def create_mcp(settings: Settings, client: MediaClient) -> FastMCP:
     async def arr_root_folders(service: ArrService) -> dict[str, Any]:
         """Return projected root-folder summaries for one Arr service."""
         return await _guarded(client.root_folders(service))
+
+    @mcp.tool(annotations=_READ_ONLY)
+    async def jellyfin_play_history(
+        user_id: JellyfinUserId,
+        media_type: JellyfinMediaType,
+        start_date: IsoDate,
+        end_date: IsoDate,
+        page: Page = 1,
+        page_size: PageSize = 50,
+        timezone_offset: TimezoneOffset = 0,
+    ) -> dict[str, Any]:
+        """Return sanitized Playback Reporting history over at most 31 days."""
+        return await _guarded(
+            client.jellyfin_history(
+                user_id,
+                media_type,
+                start_date,
+                end_date,
+                page,
+                page_size,
+                timezone_offset,
+            )
+        )
 
     @mcp.tool(annotations=_READ_ONLY)
     async def tautulli_play_history(

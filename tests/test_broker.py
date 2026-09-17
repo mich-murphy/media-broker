@@ -14,6 +14,7 @@ from starlette.testclient import TestClient
 
 from media_broker.adapters import (
     ArrService,
+    JellyfinMediaType,
     MediaClient,
     ParameterError,
     UpstreamError,
@@ -30,7 +31,13 @@ from media_broker.config import (
 from media_broker.server import build_app
 
 TOKEN = "broker-secret-token-0123456789abcdef"
-SERVICES = {"sonarr": "v3", "radarr": "v3", "lidarr": "v1", "tautulli": "v2"}
+SERVICES = {
+    "sonarr": "v3",
+    "radarr": "v3",
+    "lidarr": "v1",
+    "tautulli": "v2",
+    "jellyfin": "v19",
+}
 Handler = Callable[[httpx.Request], httpx.Response]
 ClientFactory = Callable[..., MediaClient]
 TOOL_NAMES = {
@@ -38,6 +45,7 @@ TOOL_NAMES = {
     "arr_quality_profiles",
     "arr_root_folders",
     "tautulli_play_history",
+    "jellyfin_play_history",
 }
 
 
@@ -185,7 +193,9 @@ def test_public_binding_requires_opt_in_and_explicit_exact_allow_lists(
     ("overrides", "message"),
     [
         ({"SONARR_API_KEY": "inline-secret"}, "API_KEY_FILE"),
+        ({"JELLYFIN_API_KEY": "inline-secret"}, "API_KEY_FILE"),
         ({"RADARR_URL": None}, "RADARR_URL"),
+        ({"JELLYFIN_URL": None}, "JELLYFIN_URL"),
         ({"RADARR_API_KEY_FILE": "/nonexistent/key"}, "regular secret file"),
         ({"MEDIA_BROKER_BIND_HOST": "192.168.1.5"}, "loopback"),
         ({"MEDIA_BROKER_ALLOW_PUBLIC_BIND": "true"}, "ALLOW_PUBLIC_BIND"),
@@ -545,6 +555,234 @@ async def test_history_date_range_bounds(
         await client.history("movie", start, end, 1, 1)
 
 
+JELLYFIN_USER = "0123456789abcdef0123456789abcdef"
+
+
+async def test_jellyfin_history_iterates_dates_and_projects_only_allowed_fields(
+    make_client: ClientFactory,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        day = request.url.path.split("/")[3]
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "Time": "01:02:03",
+                    "Id": f"item-{day}",
+                    "Name": f"Title {day}",
+                    "Type": "Episode",
+                    "Duration": 91.5,
+                    "RowId": 7,
+                    "Client": "private client",
+                    "Method": "private method",
+                    "Device": "private device",
+                    "UserName": "private username",
+                    "Unknown": "must not pass",
+                }
+            ],
+        )
+
+    result = await make_client(handler).jellyfin_history(
+        JELLYFIN_USER, "episode", "2024-01-01", "2024-01-02", 1, 10, 5.5
+    )
+    assert [request.url.path for request in seen] == [
+        f"/user_usage_stats/{JELLYFIN_USER}/2024-01-01/GetItems",
+        f"/user_usage_stats/{JELLYFIN_USER}/2024-01-02/GetItems",
+    ]
+    assert [dict(request.url.params) for request in seen] == [
+        {"filter": "Episode", "timezoneOffset": "5.5"},
+        {"filter": "Episode", "timezoneOffset": "5.5"},
+    ]
+    assert all(request.headers["x-emby-token"] == "jellyfin-key" for request in seen)
+    assert all("x-api-key" not in request.headers for request in seen)
+    assert result["items"] == [
+        {
+            "jellyfin_user_id": JELLYFIN_USER,
+            "media_type": "episode",
+            "played_at": "2024-01-01T01:02:03",
+            "jellyfin_item_id": "item-2024-01-01",
+            "jellyfin_history_id": 7,
+            "title": "Title 2024-01-01",
+            "duration_seconds": 91.5,
+        },
+        {
+            "jellyfin_user_id": JELLYFIN_USER,
+            "media_type": "episode",
+            "played_at": "2024-01-02T01:02:03",
+            "jellyfin_item_id": "item-2024-01-02",
+            "jellyfin_history_id": 7,
+            "title": "Title 2024-01-02",
+            "duration_seconds": 91.5,
+        },
+    ]
+    assert "completed" not in result["items"][0]
+
+
+@pytest.mark.parametrize(
+    ("media_type", "expected_filter"),
+    [("movie", "Movie"), ("episode", "Episode"), ("track", "Audio")],
+)
+async def test_jellyfin_media_type_filters(
+    make_client: ClientFactory,
+    media_type: JellyfinMediaType,
+    expected_filter: str,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler)
+    await client.jellyfin_history(
+        JELLYFIN_USER, media_type, "2024-01-01", "2024-01-01", 1, 1, 0
+    )
+    assert dict(seen[0].url.params) == {
+        "filter": expected_filter,
+        "timezoneOffset": "0",
+    }
+
+
+async def test_jellyfin_history_bounds_projected_strings(
+    make_client: ClientFactory,
+) -> None:
+    oversized = "x" * 1025
+    result = await make_client(
+        reply(
+            [
+                {
+                    "Id": oversized,
+                    "RowId": oversized,
+                    "Name": oversized,
+                    "Duration": 120,
+                    "Time": oversized,
+                }
+            ]
+        )
+    ).jellyfin_history(JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0)
+    item = result["items"][0]
+    assert item["jellyfin_item_id"] is None
+    assert item["jellyfin_history_id"] is None
+    assert item["title"] is None
+    assert item["played_at"] is None
+
+
+async def test_jellyfin_history_scalar_validation_and_missing_fields(
+    make_client: ClientFactory,
+) -> None:
+    result = await make_client(
+        reply(
+            [
+                {
+                    "Id": True,
+                    "RowId": {"private": "data"},
+                    "Name": 12,
+                    "Duration": "120",
+                    "Time": None,
+                    "Client": "must not pass",
+                }
+            ]
+        )
+    ).jellyfin_history(JELLYFIN_USER, "track", "2024-01-01", "2024-01-01", 1, 1, 0)
+    assert result["items"] == [
+        {
+            "jellyfin_user_id": JELLYFIN_USER,
+            "media_type": "track",
+            "played_at": None,
+            "jellyfin_item_id": None,
+            "jellyfin_history_id": None,
+            "title": None,
+            "duration_seconds": None,
+        }
+    ]
+
+
+async def test_jellyfin_history_local_pagination(
+    make_client: ClientFactory,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        day = request.url.path.split("/")[3]
+        count = 2 if day == "2024-01-01" else 1
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "Time": "00:00:01",
+                    "Id": f"{day}-{index}",
+                    "RowId": index,
+                    "Name": f"{day}-{index}",
+                    "Duration": index,
+                }
+                for index in range(count)
+            ],
+        )
+
+    result = await make_client(handler).jellyfin_history(
+        JELLYFIN_USER, "movie", "2024-01-01", "2024-01-02", 2, 2, 0
+    )
+    assert [item["title"] for item in result["items"]] == ["2024-01-02-0"]
+    assert result["pagination"] == {
+        "page": 2,
+        "page_size": 2,
+        "returned_count": 1,
+        "total_count": 3,
+        "has_more": False,
+        "upstream_paginated": False,
+        "upstream_truncated": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"not": "a list"}, "unexpected Jellyfin history"),
+        ([{"Time": "00:00:00"}, "not an object"], "unexpected Jellyfin history"),
+    ],
+)
+async def test_jellyfin_history_rejects_malformed_day_results(
+    make_client: ClientFactory, payload: Any, message: str
+) -> None:
+    with pytest.raises(UpstreamError, match=message):
+        await make_client(reply(payload)).jellyfin_history(
+            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+        )
+
+
+async def test_jellyfin_history_rejects_excess_aggregate_rows(
+    make_client: ClientFactory,
+) -> None:
+    with pytest.raises(UpstreamError, match="too many Jellyfin history rows"):
+        await make_client(reply([{}] * 10_001)).jellyfin_history(
+            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("user_id", "timezone_offset"),
+    [("short", 0), ("g" * 32, 0), (JELLYFIN_USER, -15), (JELLYFIN_USER, 15)],
+)
+async def test_jellyfin_history_rejects_unsafe_arguments(
+    make_client: ClientFactory, user_id: str, timezone_offset: int
+) -> None:
+    message = "user_id" if user_id != JELLYFIN_USER else "timezone_offset"
+    with pytest.raises(ParameterError, match=message):
+        await make_client(reply([])).jellyfin_history(
+            user_id, "movie", "2024-01-01", "2024-01-01", 1, 1, timezone_offset
+        )
+
+
+async def test_jellyfin_history_propagates_authorization_failure(
+    make_client: ClientFactory,
+) -> None:
+    with pytest.raises(UpstreamError, match="HTTP 403"):
+        await make_client(reply({"private": "detail"}, 403)).jellyfin_history(
+            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+        )
+
+
 # --- authenticated MCP surface ------------------------------------------------
 
 MCP_HEADERS = {
@@ -555,9 +793,23 @@ MCP_HEADERS = {
 
 
 def route_upstreams(request: httpx.Request) -> httpx.Response:
-    """A fake upstream that answers Arr and Tautulli endpoints with one item each."""
+    """A fake upstream that answers Arr and history endpoints with one item each."""
     if request.url.path == "/api/v2":
         return history_reply([{"title": "Movie", "user_id": 3}])(request)
+    if request.url.path.startswith("/user_usage_stats/"):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "Id": "item-id",
+                    "RowId": 8,
+                    "Name": "Movie",
+                    "Type": "Movie",
+                    "Time": "12:34:56",
+                    "Duration": 120,
+                }
+            ],
+        )
     return httpx.Response(
         200, json=[{"id": 1, "title": "Item", "name": "HD", "path": "/tv"}]
     )
@@ -654,6 +906,13 @@ def test_tools_are_discoverable_read_only_and_schema_bounded(mcp: TestClient) ->
     )
     history = tools["tautulli_play_history"]["inputSchema"]["properties"]
     assert history["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
+    jellyfin = tools["jellyfin_play_history"]["inputSchema"]["properties"]
+    assert jellyfin["media_type"]["enum"] == ["movie", "episode", "track"]
+    assert jellyfin["user_id"]["pattern"] == r"^[0-9a-fA-F]{32}$"
+    assert (
+        jellyfin["timezone_offset"]["minimum"],
+        jellyfin["timezone_offset"]["maximum"],
+    ) == (-14, 14)
 
 
 @pytest.mark.parametrize(
@@ -674,6 +933,23 @@ def test_tools_are_discoverable_read_only_and_schema_bounded(mcp: TestClient) ->
                 "end_date": "2024-01-31",
             },
             {"items": [{"title": "Movie", "tautulli_user_id": 3}]},
+        ),
+        (
+            "jellyfin_play_history",
+            {
+                "user_id": "0123456789abcdef0123456789abcdef",
+                "media_type": "movie",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-01",
+            },
+            {
+                "items": [
+                    {
+                        "title": "Movie",
+                        "jellyfin_user_id": "0123456789abcdef0123456789abcdef",
+                    }
+                ]
+            },
         ),
     ],
 )
@@ -721,6 +997,27 @@ def test_each_tool_answers_over_streamable_http(
                 "end_date": "2024-03-01",
             },
             "31 inclusive",
+        ),
+        (
+            "jellyfin_play_history",
+            {
+                "user_id": "not-a-user-id",
+                "media_type": "movie",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-01",
+            },
+            "user_id",
+        ),
+        (
+            "jellyfin_play_history",
+            {
+                "user_id": JELLYFIN_USER,
+                "media_type": "movie",
+                "start_date": "2024-01-01",
+                "end_date": "2024-01-01",
+                "timezone_offset": 15,
+            },
+            "timezone_offset",
         ),
     ],
 )

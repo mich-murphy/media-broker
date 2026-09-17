@@ -18,6 +18,7 @@ _UPSTREAM_API_VERSIONS = {
     "radarr": "v3",
     "lidarr": "v1",
     "tautulli": "v2",
+    "jellyfin": "v19",
 }
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 _PUBLIC = "0.0.0.0"  # noqa: S104 - permitted only with an explicit opt-in flag
