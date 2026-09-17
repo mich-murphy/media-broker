@@ -12,7 +12,12 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from media_broker.adapters import MediaClient, ParameterError, UpstreamError
+from media_broker.adapters import (
+    ArrService,
+    MediaClient,
+    ParameterError,
+    UpstreamError,
+)
 from media_broker.config import (
     ConfigError,
     Settings,
@@ -232,7 +237,7 @@ def test_bearer_token_file_must_be_private_and_well_formed(
 )
 async def test_inventory_projects_allow_listed_fields_only(
     make_client: ClientFactory,
-    service: str,
+    service: ArrService,
     path: str,
     upstream_item: dict[str, str],
     title: str,
@@ -253,7 +258,7 @@ async def test_inventory_projects_allow_listed_fields_only(
         }
         return httpx.Response(200, json=[item | upstream_item])
 
-    result = await make_client(handler).inventory(service, 1, 10)  # type: ignore[arg-type]
+    result = await make_client(handler).inventory(service, 1, 10)
     assert result["items"] == [
         {
             "id": 4,
