@@ -1,13 +1,11 @@
 """Configuration and secret-file handling for the media broker."""
 
-from __future__ import annotations
-
 import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 
 class ConfigError(ValueError):
@@ -15,6 +13,35 @@ class ConfigError(ValueError):
 
 
 _BEARER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+_UPSTREAM_API_VERSIONS = {
+    "sonarr": "v3",
+    "radarr": "v3",
+    "lidarr": "v1",
+    "tautulli": "v2",
+}
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+_PUBLIC = "0.0.0.0"  # noqa: S104 - permitted only with an explicit opt-in flag
+
+
+@dataclass(frozen=True, slots=True)
+class Upstream:
+    base_url: str
+    api_key: str = field(repr=False)
+    api_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    """Fully loaded settings; credential fields are excluded from repr output."""
+
+    bearer_token: str = field(repr=False)
+    upstreams: dict[str, Upstream]
+    allowed_hosts: tuple[str, ...]
+    allowed_origins: tuple[str, ...]
+    bind_host: str
+    port: int
+    timeout_seconds: float = 10.0
+    max_response_bytes: int = 2_000_000
 
 
 def _required(name: str) -> str:
@@ -24,12 +51,14 @@ def _required(name: str) -> str:
     return value
 
 
-def read_secret_file(path_value: str, name: str) -> str:
-    """Read one secret from a configured file without ever logging its contents."""
-    path = Path(path_value).expanduser()
+def _secret(name: str) -> str:
+    """Read the secret file named by an environment variable, never logging it."""
+    path = Path(_required(name)).expanduser()
     try:
         if not path.is_file():
             raise ConfigError(f"{name} must name a regular secret file")
+        if path.stat().st_mode & 0o007:
+            raise ConfigError(f"{name} must not be world-readable")
         value = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ConfigError(f"unable to read {name}") from exc
@@ -38,39 +67,65 @@ def read_secret_file(path_value: str, name: str) -> str:
     return value
 
 
+def _split(name: str, value: str, expected: str) -> SplitResult:
+    """Split a URL or authority, rejecting wildcards, credentials, and bad ports."""
+    if not value or "*" in value or any(character.isspace() for character in value):
+        raise ConfigError(f"invalid {name}: expected an exact {expected}")
+    try:
+        parsed = urlsplit(value if "://" in value else "//" + value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"invalid {name}: malformed {expected}") from exc
+    if not parsed.hostname or parsed.username or parsed.query or parsed.fragment:
+        raise ConfigError(f"invalid {name}: expected an exact {expected}")
+    return parsed
+
+
 def validate_endpoint(name: str, value: str) -> str:
     """Validate an upstream base URL and return it without a trailing slash."""
-    if any(character.isspace() for character in value):
-        raise ConfigError(f"invalid {name}: whitespace is not allowed")
-    try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-        parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"invalid {name}: malformed URL") from exc
-    if parsed.scheme not in {"http", "https"} or not hostname:
+    if _split(name, value, "http(s) URL").scheme not in {"http", "https"}:
         raise ConfigError(f"invalid {name}: expected an http(s) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ConfigError(
-            f"invalid {name}: userinfo, query, and fragment are not allowed"
-        )
     return value.rstrip("/")
 
 
-def _flag(name: str, default: bool = False) -> bool:
+def validate_allowed_host(name: str, value: str) -> str:
+    """Validate one exact HTTP Host authority; wildcard patterns are forbidden."""
+    parsed = _split(name, value, "Host authority")
+    if parsed.scheme or parsed.path:
+        raise ConfigError(f"invalid {name}: expected an exact Host authority")
+    return value
+
+
+def validate_allowed_origin(name: str, value: str) -> str:
+    """Validate one exact origin without wildcard, path, or credential syntax."""
+    parsed = _split(name, value, "Origin")
+    if parsed.scheme not in {"http", "https"} or parsed.path:
+        raise ConfigError(f"invalid {name}: expected an exact Origin")
+    return value
+
+
+def _flag(name: str) -> bool:
     """Parse an explicit boolean configuration value; never guess on typos."""
-    raw = os.environ.get(name, str(default).lower()).strip().casefold()
-    if raw == "true":
-        return True
-    if raw == "false":
-        return False
-    raise ConfigError(f"{name} must be true or false")
+    raw = os.environ.get(name, "false").strip().casefold()
+    if raw not in {"true", "false"}:
+        raise ConfigError(f"{name} must be true or false")
+    return raw == "true"
+
+
+def _number[N: (int, float)](name: str, default: N, low: N, high: N) -> N:
+    try:
+        value = type(default)(os.environ.get(name, str(default)))
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    if not low <= value <= high:
+        raise ConfigError(f"{name} must be between {low} and {high}")
+    return value
 
 
 def _csv(
     name: str,
     default: tuple[str, ...] | None,
-    validator: Callable[[str, str], str] | None = None,
+    validate: Callable[[str, str], str],
 ) -> tuple[str, ...]:
     raw = os.environ.get(name)
     values = (
@@ -80,164 +135,57 @@ def _csv(
     )
     if not values:
         raise ConfigError(f"{name} must contain at least one value")
-    if validator is not None:
-        for value in values:
-            validator(name, value)
-    return values
-
-
-def validate_allowed_host(name: str, value: str) -> str:
-    """Validate one exact HTTP Host authority; wildcard patterns are forbidden."""
-    if not value or any(character.isspace() for character in value) or "*" in value:
-        raise ConfigError(f"invalid {name}: expected an exact Host authority")
-    if value.count(":") > 1 and not value.startswith("["):
-        raise ConfigError(f"invalid {name}: IPv6 Host values must be bracketed")
-    try:
-        parsed = urlsplit("//" + value)
-        if (
-            not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ConfigError(f"invalid {name}: expected an exact Host authority")
-        parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"invalid {name}: malformed Host authority") from exc
-    return value
-
-
-def validate_allowed_origin(name: str, value: str) -> str:
-    """Validate one exact origin without wildcard, path, or credential syntax."""
-    if not value or any(character.isspace() for character in value) or "*" in value:
-        raise ConfigError(f"invalid {name}: expected an exact Origin")
-    try:
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ConfigError(f"invalid {name}: expected an exact Origin")
-        parsed.port
-    except ValueError as exc:
-        raise ConfigError(f"invalid {name}: malformed Origin") from exc
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class Settings:
-    """Fully loaded settings; credential fields are excluded from repr output."""
-
-    bearer_token: str = field(repr=False)
-    upstreams: dict[str, "Upstream"]
-    allowed_hosts: tuple[str, ...]
-    allowed_origins: tuple[str, ...]
-    bind_host: str
-    port: int
-    timeout_seconds: float = 10.0
-    max_response_bytes: int = 2_000_000
-    max_items: int = 10_000
-
-
-@dataclass(frozen=True, slots=True)
-class Upstream:
-    name: str
-    base_url: str
-    api_key: str = field(repr=False)
-    api_version: str
+    return tuple(validate(name, value) for value in values)
 
 
 def load_settings() -> Settings:
     """Load all required values from environment and explicitly named files."""
-    direct_key_names = (
-        "SONARR_API_KEY",
-        "RADARR_API_KEY",
-        "LIDARR_API_KEY",
-        "TAUTULLI_API_KEY",
-    )
-    if any(os.environ.get(name) for name in direct_key_names):
-        raise ConfigError("upstream API keys must be configured with *_API_KEY_FILE")
-
+    for service in _UPSTREAM_API_VERSIONS:
+        if os.environ.get(f"{service.upper()}_API_KEY"):
+            raise ConfigError(
+                "upstream API keys must be configured with *_API_KEY_FILE"
+            )
     bind_host = os.environ.get("MEDIA_BROKER_BIND_HOST", "127.0.0.1").strip()
-    public_bind = _flag("MEDIA_BROKER_ALLOW_PUBLIC_BIND")
-    if bind_host not in {"127.0.0.1", "::1", "localhost", "0.0.0.0"}:
+    if bind_host not in _LOOPBACK | {_PUBLIC}:
         raise ConfigError("MEDIA_BROKER_BIND_HOST must be loopback or 0.0.0.0")
-    if bind_host == "0.0.0.0" and not public_bind:
+    public = bind_host == _PUBLIC
+    if _flag("MEDIA_BROKER_ALLOW_PUBLIC_BIND") != public:
         raise ConfigError(
-            "MEDIA_BROKER_ALLOW_PUBLIC_BIND=true is required for 0.0.0.0"
+            "MEDIA_BROKER_ALLOW_PUBLIC_BIND=true is required for 0.0.0.0 only"
         )
-    if bind_host != "0.0.0.0" and public_bind:
-        raise ConfigError(
-            "MEDIA_BROKER_ALLOW_PUBLIC_BIND is only valid with 0.0.0.0"
-        )
-    try:
-        port = int(os.environ.get("MEDIA_BROKER_PORT", "8000"))
-        timeout = float(os.environ.get("MEDIA_BROKER_TIMEOUT_SECONDS", "10"))
-        max_response = int(os.environ.get("MEDIA_BROKER_MAX_RESPONSE_BYTES", "2000000"))
-    except ValueError as exc:
-        raise ConfigError("numeric broker configuration is invalid") from exc
-    if (
-        not 1 <= port <= 65535
-        or not 0 < timeout <= 60
-        or not 1_000 <= max_response <= 50_000_000
-    ):
-        raise ConfigError("numeric broker configuration is out of bounds")
-
-    # Exact defaults are loopback-only, never a universal Host allow-list.
-    authority_host = f"[{bind_host}]" if ":" in bind_host else bind_host
-    default_host = f"{authority_host}:{port}"
-    upstream_specs = {
-        "sonarr": ("SONARR_URL", "SONARR_API_KEY_FILE", "v3"),
-        "radarr": ("RADARR_URL", "RADARR_API_KEY_FILE", "v3"),
-        "lidarr": ("LIDARR_URL", "LIDARR_API_KEY_FILE", "v1"),
-        "tautulli": ("TAUTULLI_URL", "TAUTULLI_API_KEY_FILE", "v2"),
-    }
-    upstreams: dict[str, Upstream] = {}
-    for name, (url_name, key_name, version) in upstream_specs.items():
-        upstreams[name] = Upstream(
-            name=name,
-            base_url=validate_endpoint(url_name, _required(url_name)),
-            api_key=read_secret_file(_required(key_name), key_name),
-            api_version=version,
-        )
-
-    if bind_host == "0.0.0.0":
-        # Public binding has no safe implicit authority. Both lists must be
-        # explicitly supplied and every value is validated as an exact match.
-        allowed_hosts = _csv("MEDIA_BROKER_ALLOWED_HOSTS", None, validate_allowed_host)
-        allowed_origins = _csv(
-            "MEDIA_BROKER_ALLOWED_ORIGINS", None, validate_allowed_origin
-        )
-    else:
-        allowed_hosts = _csv(
-            "MEDIA_BROKER_ALLOWED_HOSTS", (default_host,), validate_allowed_host
-        )
-        allowed_origins = _csv(
-            "MEDIA_BROKER_ALLOWED_ORIGINS",
-            (f"http://{default_host}",),
-            validate_allowed_origin,
-        )
-    bearer_token = read_secret_file(
-        _required("MEDIA_BROKER_TOKEN_FILE"), "MEDIA_BROKER_TOKEN_FILE"
-    )
+    port = _number("MEDIA_BROKER_PORT", 8000, 1, 65535)
+    # Loopback binding defaults to its own exact authority; public binding has
+    # no safe implicit authority, so both allow-lists must be supplied.
+    host = f"[{bind_host}]" if ":" in bind_host else bind_host
+    authority = None if public else (f"{host}:{port}",)
+    origin = None if public else (f"http://{host}:{port}",)
+    bearer_token = _secret("MEDIA_BROKER_TOKEN_FILE")
     if not _BEARER_TOKEN.fullmatch(bearer_token):
         raise ConfigError(
             "MEDIA_BROKER_TOKEN_FILE must contain 32-256 URL-safe characters"
         )
     return Settings(
         bearer_token=bearer_token,
-        upstreams=upstreams,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
+        upstreams={
+            service: Upstream(
+                base_url=validate_endpoint(
+                    f"{service.upper()}_URL", _required(f"{service.upper()}_URL")
+                ),
+                api_key=_secret(f"{service.upper()}_API_KEY_FILE"),
+                api_version=version,
+            )
+            for service, version in _UPSTREAM_API_VERSIONS.items()
+        },
+        allowed_hosts=_csv(
+            "MEDIA_BROKER_ALLOWED_HOSTS", authority, validate_allowed_host
+        ),
+        allowed_origins=_csv(
+            "MEDIA_BROKER_ALLOWED_ORIGINS", origin, validate_allowed_origin
+        ),
         bind_host=bind_host,
         port=port,
-        timeout_seconds=timeout,
-        max_response_bytes=max_response,
+        timeout_seconds=_number("MEDIA_BROKER_TIMEOUT_SECONDS", 10.0, 0.1, 60.0),
+        max_response_bytes=_number(
+            "MEDIA_BROKER_MAX_RESPONSE_BYTES", 2_000_000, 1_000, 50_000_000
+        ),
     )

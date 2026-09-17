@@ -40,10 +40,12 @@ export MEDIA_BROKER_ALLOWED_ORIGINS=http://127.0.0.1:8000
 uv run media-broker
 ```
 
-All four upstreams and all secret files are required. The broker defaults to
-loopback binding, HTTPS certificate verification, no redirects, a 10-second
-total upstream deadline, and a 2 MB upstream response limit. Host and Origin
-values are exact allow-lists; wildcard syntax is rejected. Tautulli requests
+All four upstreams and all secret files are required, and a secret file that is
+world-readable is refused at startup. The broker defaults to loopback binding,
+HTTPS certificate verification, no redirects, a 10-second total upstream
+deadline (`MEDIA_BROKER_TIMEOUT_SECONDS`, 0.1-60), and a 2 MB upstream response
+limit (`MEDIA_BROKER_MAX_RESPONSE_BYTES`, 1000-50000000). Host and Origin values
+are exact allow-lists; wildcard syntax is rejected. Tautulli requests
 use its inclusive `after`/`before` date bounds with `grouping=0` and
 `include_activity=0` so each returned row represents a playback event.
 All upstreams use `X-Api-Key` header authentication. Tautulli 2.18.1 supports
@@ -58,7 +60,25 @@ returned. Tautulli's numeric watched status of `1` means completed; `0`,
 `0.25`, `0.5`, and `0.75` mean incomplete. A missing or unrecognized status
 is reported as unknown, not false.
 
-Run checks with `uv run --dev pytest` and `uv run --dev ruff check .`.
+Tool argument bounds (page 1-100000, page size 1-100, search up to 200
+characters, strict `YYYY-MM-DD` dates, non-negative `user_id`) are declared in
+each tool's input schema, so clients see them before calling. Rejected
+arguments, upstream failures, and unexpected errors are all reported through the
+MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys
+never reach the caller. Responses use the Streamable HTTP JSON mode because the
+server is stateless and never streams server-initiated messages.
+
+CI enforces formatting, linting, cyclomatic complexity (McCabe 8), strict type
+checking, tests, a dependency vulnerability audit, and an image build:
+
+```sh
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
+uv run pytest
+uv export --no-dev --no-emit-project --no-hashes -o requirements.txt
+uv run pip-audit --strict --disable-pip --no-deps -r requirements.txt
+```
 
 ## Container image
 
@@ -69,9 +89,10 @@ CI builds the image on every merge to `main` and publishes it to GHCR as:
 - `ghcr.io/mich-murphy/media-broker:sha-<commit>` — immutable tag used for
   rollback and auditing.
 
-The image is private to the `mich-murphy` account. It runs as UID/GID 65532
-with a read-only filesystem, listens on container port 8000, and expects all
-credentials as file paths (`*_FILE` variables), never values.
+The image is private to the `mich-murphy` account. Its runtime stage contains
+only the virtual environment (no pip, uv, or source tree), runs as UID/GID
+65532 with a read-only filesystem, listens on container port 8000, and expects
+all credentials as file paths (`*_FILE` variables), never values.
 
 `tests/container.sh` performs an isolated local build-and-probe against fake
 upstreams using the `desktop-linux` Docker context; it creates and removes
