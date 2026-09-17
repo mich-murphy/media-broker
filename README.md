@@ -8,15 +8,17 @@ repository; see its `docs/hermes-media.md` for the deployment runbook.
 
 This project exposes a small MCP server over the official Python SDK's
 Streamable HTTP transport. The adapters target Sonarr 4.0.19 (API v3), Radarr
-6.3.0 (API v3), Lidarr 3.1.0 (API v1), and Tautulli 2.18.1. It has four tools:
+6.3.0 (API v3), Lidarr 3.1.0 (API v1), Tautulli 2.18.1, and the Jellyfin
+Playback Reporting plugin (v19). It has five tools:
 
 - `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination)
 - `arr_quality_profiles`
 - `arr_root_folders`
 - `tautulli_play_history` (movie, episode, or track; inclusive maximum 31-day range and optional numeric user filter)
+- `jellyfin_play_history` (movie, episode, or track; inclusive maximum 31-day range, exact 32-hex-character user id, and local pagination)
 
 There are no write tools, generic upstream requests, approval endpoints, Seerr,
-or Jellyfin integrations. Arr APIs return arrays, so inventory pagination is
+or Jellyfin core endpoints. Arr APIs return arrays, so inventory pagination is
 performed after one bounded response and reports that fact honestly.
 
 ## Local run
@@ -35,12 +37,14 @@ export LIDARR_URL=http://127.0.0.1:8686
 export LIDARR_API_KEY_FILE=/run/user/1000/media-broker/lidarr
 export TAUTULLI_URL=http://127.0.0.1:8181
 export TAUTULLI_API_KEY_FILE=/run/user/1000/media-broker/tautulli
+export JELLYFIN_URL=http://127.0.0.1:8096
+export JELLYFIN_API_KEY_FILE=/run/user/1000/media-broker/jellyfin
 export MEDIA_BROKER_ALLOWED_HOSTS=127.0.0.1:8000
 export MEDIA_BROKER_ALLOWED_ORIGINS=http://127.0.0.1:8000
 uv run media-broker
 ```
 
-All four upstreams and all secret files are required, and a secret file that is
+All five upstreams and all secret files are required, and a secret file that is
 world-readable is refused at startup. The broker defaults to loopback binding,
 HTTPS certificate verification, no redirects, a 10-second total upstream
 deadline (`MEDIA_BROKER_TIMEOUT_SECONDS`, 0.1-60), and a 2 MB upstream response
@@ -48,20 +52,28 @@ limit (`MEDIA_BROKER_MAX_RESPONSE_BYTES`, 1000-50000000). Host and Origin values
 are exact allow-lists; wildcard syntax is rejected. Tautulli requests
 use its inclusive `after`/`before` date bounds with `grouping=0` and
 `include_activity=0` so each returned row represents a playback event.
-All upstreams use `X-Api-Key` header authentication. Tautulli 2.18.1 supports
-this header; the broker never includes credentials in query URLs.
+Arr and Tautulli use `X-Api-Key` header authentication; Jellyfin uses its
+`X-Emby-Token` header. The broker never includes credentials in query URLs.
+Jellyfin Playback Reporting history requests one allow-listed `GetItems` route
+per day with a requested `Movie`, `Episode`, or `Audio` filter and timezone
+offset. Results are projected to the requested user and local date/time; no
+completion claim is made because plugin rows may represent active sessions.
 
 History projections contain only scalar, validated fields. The explicitly
 approved stable identifiers `tautulli_user_id`, `tautulli_rating_key`, and
 `tautulli_history_id` come from Tautulli's `user_id`, `rating_key`, and `id`
-fields respectively. They are present for household selection and stable
-matching; names, emails, IPs, device identifiers, and unknown fields are not
+fields respectively. Jellyfin history maps the requested `user_id` to
+`jellyfin_user_id` and uses its `Id` and `RowId` for source-prefixed item and
+history identifiers.
+They are present for household selection and stable matching; names, emails,
+IP addresses, client/method/device identifiers, and unknown fields are not
 returned. Tautulli's numeric watched status of `1` means completed; `0`,
 `0.25`, `0.5`, and `0.75` mean incomplete. A missing or unrecognized status
 is reported as unknown, not false.
 
 Tool argument bounds (page 1-100000, page size 1-100, search up to 200
-characters, strict `YYYY-MM-DD` dates, non-negative `user_id`) are declared in
+characters, strict `YYYY-MM-DD` dates, non-negative Tautulli `user_id`, and
+Jellyfin timezone offsets from -14 to 14 hours) are declared in
 each tool's input schema, so clients see them before calling. Rejected
 arguments, upstream failures, and unexpected errors are all reported through the
 MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys
