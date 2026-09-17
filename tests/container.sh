@@ -16,7 +16,7 @@ docker_cmd() { docker --context desktop-linux "$@"; }
   exit 2
 }
 endpoint=$(docker_cmd context inspect --format '{{(index .Endpoints "docker").Host}}' desktop-linux)
-[[ "${endpoint}" == unix:///Users/mm/.docker/run/docker.sock ]] || {
+[[ "${endpoint}" == "unix://${HOME}/.docker/run/docker.sock" ]] || {
   echo "unexpected desktop-linux Docker endpoint: ${endpoint}" >&2
   exit 2
 }
