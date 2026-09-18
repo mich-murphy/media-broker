@@ -13,12 +13,13 @@ Playback Reporting plugin (v19).
 
 Read tools, always available:
 
-- `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination)
+- `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination; includes the added date, genres, size on disk, and file counts for cleanup audits)
 - `arr_quality_profiles`
 - `arr_root_folders`
 - `arr_search_candidates` (upstream catalog lookup; bounded, projected results)
 - `tautulli_play_history` (movie, episode, or track; inclusive maximum 31-day range and optional numeric user filter)
 - `jellyfin_play_history` (movie, episode, or track; inclusive maximum 31-day range, exact 32-hex-character user id, and local pagination)
+- `jellyfin_users` (id/name pairs from `GET /Users`, so `jellyfin_play_history` user ids are discoverable without dashboard access)
 
 Write tools, registered only when enabled:
 
@@ -96,15 +97,27 @@ per day with a requested `Movie`, `Episode`, or `Audio` filter and timezone
 offset. Results are projected to the requested user and local date/time; no
 completion claim is made because plugin rows may represent active sessions.
 
+Inventory projections add the fields a cleanup audit needs on top of the base
+metadata. `added` is the library add date on all three Arr services. `genres`
+is a string list capped at 16 entries with each entry bounded like any
+projected string. `size_on_disk_bytes` comes from Radarr's `movieFile.size`
+and from `statistics.sizeOnDisk` on Sonarr and Lidarr. File presence is
+Radarr's `hasFile` for movies; for series and artists the broker projects
+`episode_file_count` or `track_file_count` from `statistics` and derives
+`has_file` from a nonzero count. A missing or wrongly typed statistics block
+projects to nulls, never to guesses.
+
 History projections contain only scalar, validated fields. The explicitly
 approved stable identifiers `tautulli_user_id`, `tautulli_rating_key`, and
 `tautulli_history_id` come from Tautulli's `user_id`, `rating_key`, and `id`
 fields respectively. Jellyfin history maps the requested `user_id` to
 `jellyfin_user_id` and uses its `Id` and `RowId` for source-prefixed item and
 history identifiers.
-They are present for household selection and stable matching; names, emails,
-IP addresses, client/method/device identifiers, and unknown fields are not
-returned. Tautulli's numeric watched status of `1` means completed; `0`,
+They are present for household selection and stable matching. Tautulli's
+`friendly_name` is projected as `user_name` so a `tautulli_user_id` maps to a
+readable account; emails, IP addresses, client/method/device identifiers, and
+unknown fields are not returned. Tautulli's numeric watched status of `1`
+means completed; `0`,
 `0.25`, `0.5`, and `0.75` mean incomplete. A missing or unrecognized status
 is reported as unknown, not false.
 

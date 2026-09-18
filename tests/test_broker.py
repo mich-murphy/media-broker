@@ -49,6 +49,7 @@ TOOL_NAMES = {
     "arr_search_candidates",
     "tautulli_play_history",
     "jellyfin_play_history",
+    "jellyfin_users",
 }
 WRITE_TOOL_NAMES = {"arr_request_media", "arr_unmonitor_media", "arr_delete_media"}
 
@@ -248,10 +249,22 @@ def test_bearer_token_file_must_be_private_and_well_formed(
 
 
 @pytest.mark.parametrize(
-    ("service", "path", "upstream_item", "title"),
+    ("service", "path", "upstream_item", "title", "extras"),
     [
-        ("sonarr", "/api/v3/series", {"title": "Example"}, "Example"),
-        ("lidarr", "/api/v1/artist", {"artistName": "Band"}, "Band"),
+        (
+            "sonarr",
+            "/api/v3/series",
+            {"title": "Example"},
+            "Example",
+            {"episode_file_count": None},
+        ),
+        (
+            "lidarr",
+            "/api/v1/artist",
+            {"artistName": "Band"},
+            "Band",
+            {"track_file_count": None},
+        ),
     ],
 )
 async def test_inventory_projects_allow_listed_fields_only(
@@ -260,6 +273,7 @@ async def test_inventory_projects_allow_listed_fields_only(
     path: str,
     upstream_item: dict[str, str],
     title: str,
+    extras: dict[str, Any],
 ) -> None:
     seen: list[httpx.Request] = []
 
@@ -274,6 +288,8 @@ async def test_inventory_projects_allow_listed_fields_only(
             "rootFolderPath": "/media",
             "path": "/media/private",
             "images": [{"url": "must not pass"}],
+            "statistics": "must not pass",
+            "movieFile": "must not pass",
         }
         return httpx.Response(200, json=[item | upstream_item])
 
@@ -287,11 +303,150 @@ async def test_inventory_projects_allow_listed_fields_only(
             "monitored": True,
             "quality_profile_id": 7,
             "root_folder_path": "/media",
+            "added": None,
+            "genres": None,
+            "size_on_disk_bytes": None,
+            "has_file": None,
+            **extras,
         }
     ]
     assert seen[0].url.path == path
     assert seen[0].headers["x-api-key"] == f"{service}-key"
     assert f"{service}-key" not in str(seen[0].url)
+
+
+@pytest.mark.parametrize(
+    ("service", "upstream_item", "expected"),
+    [
+        (
+            "sonarr",
+            {
+                "statistics": {
+                    "sizeOnDisk": 12_000_000_000,
+                    "episodeFileCount": 3,
+                    "percentOfEpisodes": "must not pass",
+                },
+                "genres": ["Anime", "Drama"],
+                "added": "2021-05-06T07:08:09Z",
+            },
+            {
+                "size_on_disk_bytes": 12_000_000_000,
+                "episode_file_count": 3,
+                "has_file": True,
+                "genres": ["Anime", "Drama"],
+                "added": "2021-05-06T07:08:09Z",
+            },
+        ),
+        (
+            "radarr",
+            {
+                "movieFile": {"size": 8_000_000_000, "relativePath": "must not pass"},
+                "hasFile": True,
+                "genres": ["Animation"],
+                "added": "2020-01-02T03:04:05Z",
+            },
+            {
+                "size_on_disk_bytes": 8_000_000_000,
+                "has_file": True,
+                "genres": ["Animation"],
+                "added": "2020-01-02T03:04:05Z",
+            },
+        ),
+        (
+            "lidarr",
+            {
+                "statistics": {"sizeOnDisk": 500, "trackFileCount": 9},
+                "genres": ["Rock"],
+                "added": "2022-03-04T05:06:07Z",
+            },
+            {
+                "size_on_disk_bytes": 500,
+                "track_file_count": 9,
+                "has_file": True,
+                "genres": ["Rock"],
+                "added": "2022-03-04T05:06:07Z",
+            },
+        ),
+    ],
+)
+async def test_inventory_projects_cleanup_audit_fields(
+    make_client: ClientFactory,
+    service: ArrService,
+    upstream_item: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    result = await make_client(
+        reply([{"id": 1, "title": "Item"} | upstream_item])
+    ).inventory(service, 1, 10)
+    item = result["items"][0]
+    assert item.items() >= expected.items()
+    assert "percentOfEpisodes" not in item
+    assert "relativePath" not in item
+
+
+@pytest.mark.parametrize(
+    ("service", "upstream_item", "expected"),
+    [
+        (
+            "sonarr",
+            {"statistics": {"sizeOnDisk": 7}},
+            {"episode_file_count": None, "has_file": None},
+        ),
+        (
+            "sonarr",
+            {"statistics": {"episodeFileCount": 0}},
+            {"episode_file_count": 0, "has_file": False},
+        ),
+        (
+            "radarr",
+            {"movieFile": {"size": "private"}, "hasFile": 1},
+            {"size_on_disk_bytes": None, "has_file": None},
+        ),
+        (
+            "lidarr",
+            {"statistics": ["must not pass"]},
+            {
+                "size_on_disk_bytes": None,
+                "track_file_count": None,
+                "has_file": None,
+            },
+        ),
+    ],
+)
+async def test_inventory_audit_fields_reject_wrong_types(
+    make_client: ClientFactory,
+    service: ArrService,
+    upstream_item: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    result = await make_client(reply([{"id": 1} | upstream_item])).inventory(
+        service, 1, 10
+    )
+    assert result["items"][0].items() >= expected.items()
+
+
+async def test_inventory_genres_are_capped_and_dropped_when_invalid(
+    make_client: ClientFactory,
+) -> None:
+    genres = [
+        "ok",
+        {"not": "a string"},
+        "x" * 1025,
+        7,
+        *[f"genre-{index}" for index in range(20)],
+    ]
+    result = await make_client(reply([{"id": 1, "genres": genres}])).inventory(
+        "radarr", 1, 10
+    )
+    # The cap applies to raw entries first; invalid entries are then dropped.
+    assert result["items"][0]["genres"] == [
+        "ok",
+        *(f"genre-{index}" for index in range(12)),
+    ]
+    not_a_list = await make_client(reply([{"id": 1, "genres": "Anime"}])).inventory(
+        "radarr", 1, 10
+    )
+    assert not_a_list["items"][0]["genres"] is None
 
 
 async def test_inventory_search_and_local_pagination(
@@ -420,6 +575,7 @@ async def test_history_request_shape_and_projection(make_client: ClientFactory) 
     row = {
         "id": 91,
         "user_id": 7,
+        "friendly_name": "Alice",
         "rating_key": "opaque-22",
         "media_type": "episode",
         "title": "Episode",
@@ -445,6 +601,7 @@ async def test_history_request_shape_and_projection(make_client: ClientFactory) 
         {
             "media_type": "episode",
             "tautulli_user_id": 7,
+            "user_name": "Alice",
             "tautulli_rating_key": "opaque-22",
             "tautulli_history_id": 91,
             "title": "Episode",
@@ -795,6 +952,52 @@ async def test_jellyfin_history_propagates_authorization_failure(
         )
 
 
+async def test_jellyfin_users_are_projected_to_id_and_name(
+    make_client: ClientFactory,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "Id": JELLYFIN_USER,
+                    "Name": "Alice",
+                    "Policy": {"IsAdministrator": "must not pass"},
+                    "LastLoginDate": "must not pass",
+                    "PrimaryImageTag": "must not pass",
+                },
+                "junk",
+            ],
+        )
+
+    result = await make_client(handler).jellyfin_users()
+    assert result == {
+        "items": [{"jellyfin_user_id": JELLYFIN_USER, "name": "Alice"}],
+        "upstream_truncated": False,
+    }
+    assert seen[0].url.path == "/Users"
+    assert seen[0].headers["x-emby-token"] == "jellyfin-key"
+    assert "x-api-key" not in seen[0].headers
+    assert "jellyfin-key" not in str(seen[0].url)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"not": "a list"}, "unexpected users"),
+        ([{}] * 10_001, "unexpected users"),
+    ],
+)
+async def test_jellyfin_users_rejects_malformed_responses(
+    make_client: ClientFactory, payload: Any, message: str
+) -> None:
+    with pytest.raises(UpstreamError, match=message):
+        await make_client(reply(payload)).jellyfin_users()
+
+
 # --- authenticated MCP surface ------------------------------------------------
 
 MCP_HEADERS = {
@@ -808,6 +1011,10 @@ def route_upstreams(request: httpx.Request) -> httpx.Response:
     """A fake upstream that answers Arr and history endpoints with one item each."""
     if request.url.path == "/api/v2":
         return history_reply([{"title": "Movie", "user_id": 3}])(request)
+    if request.url.path == "/Users":
+        return httpx.Response(
+            200, json=[{"Id": JELLYFIN_USER, "Name": "Alice", "Policy": {}}]
+        )
     if request.url.path.startswith("/user_usage_stats/"):
         return httpx.Response(
             200,
@@ -968,6 +1175,11 @@ def test_tools_are_discoverable_read_only_and_schema_bounded(mcp: TestClient) ->
                     }
                 ]
             },
+        ),
+        (
+            "jellyfin_users",
+            {},
+            {"items": [{"name": "Alice", "jellyfin_user_id": JELLYFIN_USER}]},
         ),
     ],
 )

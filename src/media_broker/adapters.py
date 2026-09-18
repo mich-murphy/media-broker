@@ -26,6 +26,7 @@ JellyfinMediaType = Literal["movie", "episode", "track"]
 
 _MAX_ITEMS = 10_000
 _MAX_PROJECTED_STRING = 1024
+_MAX_LIST_ENTRIES = 16
 _MAX_REQUEST_BYTES = 262_144
 _CONFIRM_TTL_SECONDS = 300
 _JELLYFIN_FILTERS = {"movie": "Movie", "episode": "Episode", "track": "Audio"}
@@ -46,6 +47,9 @@ _ARR_ITEM: _Fields = {
     "monitored": ("monitored", bool),
     "quality_profile_id": ("qualityProfileId", int),
     "root_folder_path": ("rootFolderPath", str),
+    "added": ("added", str),
+    # A list marker in place of scalar types projects a bounded string list.
+    "genres": ("genres", list),
 }
 _QUALITY_PROFILE: _Fields = {
     "id": ("id", int),
@@ -63,6 +67,7 @@ _ROOT_FOLDER: _Fields = {
 # The source-prefixed identifiers are approved for household matching.
 _HISTORY_ITEM: _Fields = {
     "tautulli_user_id": ("user_id", int, str),
+    "user_name": ("friendly_name", str),
     "tautulli_rating_key": ("rating_key", int, str),
     "tautulli_history_id": ("id", int, str),
     "title": ("title", str),
@@ -76,6 +81,10 @@ _JELLYFIN_HISTORY_ITEM: _Fields = {
     "jellyfin_history_id": ("RowId", int, str),
     "title": ("Name", str),
     "duration_seconds": ("Duration", int, float),
+}
+_JELLYFIN_USER: _Fields = {
+    "jellyfin_user_id": ("Id", str),
+    "name": ("Name", str),
 }
 
 
@@ -93,6 +102,7 @@ class ArrServiceSpec:
     build_add: Callable[  # (candidate, quality, metadata, root, search) -> body
         [Mapping[str, Any], int, int | None, str, bool], dict[str, Any]
     ]
+    inventory_extras: Callable[[Mapping[str, Any]], dict[str, Any]]
     needs_metadata: bool = False
 
 
@@ -118,10 +128,25 @@ def _bounded(value: Any) -> Any:
     )
 
 
+def _string_list(value: Any) -> list[str] | None:
+    """Project a capped list of bounded strings, dropping invalid entries."""
+    if not isinstance(value, list):
+        return None
+    return [
+        entry
+        for raw in value[:_MAX_LIST_ENTRIES]
+        if isinstance(entry := _bounded(_scalar(raw, str)), str)
+    ]
+
+
 def _project(row: Mapping[str, Any], fields: _Fields) -> dict[str, Any]:
-    """Project one upstream row to allowed keys, scalar types, bounded strings."""
+    """Project one upstream row to allowed keys, typed scalars, bounded values."""
     return {
-        name: _bounded(_scalar(row.get(spec[0]), *spec[1:]))
+        name: (
+            _string_list(row.get(spec[0]))
+            if list in spec[1:]
+            else _bounded(_scalar(row.get(spec[0]), *spec[1:]))
+        )
         for name, spec in fields.items()
     }
 
@@ -237,8 +262,45 @@ def _lidarr_add_body(
     }
 
 
+def _statistics(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return the embedded statistics block only when it is an object."""
+    stats = row.get("statistics")
+    return stats if isinstance(stats, Mapping) else {}
+
+
+def _radarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
+    file = row.get("movieFile")
+    return {
+        "size_on_disk_bytes": _scalar(
+            file.get("size") if isinstance(file, Mapping) else None, int
+        ),
+        "has_file": _scalar(row.get("hasFile"), bool),
+    }
+
+
+def _sonarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
+    stats = _statistics(row)
+    count = _scalar(stats.get("episodeFileCount"), int)
+    return {
+        "size_on_disk_bytes": _scalar(stats.get("sizeOnDisk"), int),
+        "episode_file_count": count,
+        "has_file": None if count is None else count > 0,
+    }
+
+
+def _lidarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
+    stats = _statistics(row)
+    count = _scalar(stats.get("trackFileCount"), int)
+    return {
+        "size_on_disk_bytes": _scalar(stats.get("sizeOnDisk"), int),
+        "track_file_count": count,
+        "has_file": None if count is None else count > 0,
+    }
+
+
 # Field order: resource, lookup_prefix, external_key, external_field,
-# title_field, id_description, id_valid, build_add, needs_metadata=False.
+# title_field, id_description, id_valid, build_add, inventory_extras,
+# needs_metadata=False.
 ARR_SERVICES: dict[ArrService, ArrServiceSpec] = {
     "sonarr": ArrServiceSpec(
         "series",
@@ -249,6 +311,7 @@ ARR_SERVICES: dict[ArrService, ArrServiceSpec] = {
         "a positive numeric TVDB identifier",
         _numeric_catalog_id,
         _sonarr_add_body,
+        _sonarr_inventory_extras,
     ),
     "radarr": ArrServiceSpec(
         "movie",
@@ -259,6 +322,7 @@ ARR_SERVICES: dict[ArrService, ArrServiceSpec] = {
         "a positive numeric TMDB identifier",
         _numeric_catalog_id,
         _radarr_add_body,
+        _radarr_inventory_extras,
     ),
     "lidarr": ArrServiceSpec(
         "artist",
@@ -269,6 +333,7 @@ ARR_SERVICES: dict[ArrService, ArrServiceSpec] = {
         "a MusicBrainz artist UUID",
         _lidarr_id,
         _lidarr_add_body,
+        _lidarr_inventory_extras,
         True,
     ),
 }
@@ -403,7 +468,10 @@ class MediaClient:
         rows = await self._arr_items(service, spec.resource)
         items = [
             # Lidarr names its title field artistName; fold it into title first.
-            _project({**r, "title": r.get(spec.title_field)}, _ARR_ITEM)
+            {
+                **_project({**r, "title": r.get(spec.title_field)}, _ARR_ITEM),
+                **spec.inventory_extras(r),
+            }
             for r in rows
         ]
         if query := (search or "").strip().casefold():
@@ -738,6 +806,21 @@ class MediaClient:
                 "upstream_paginated": False,
                 "upstream_truncated": False,
             },
+        }
+
+    async def jellyfin_users(self) -> dict[str, Any]:
+        """Project Jellyfin's user list to id and name pairs for history lookups."""
+        upstream = self.settings.upstreams["jellyfin"]
+        payload = await self._json(upstream, upstream.base_url + "/Users")
+        if not isinstance(payload, list) or len(payload) > _MAX_ITEMS:
+            raise UpstreamError("upstream returned an unexpected users response")
+        return {
+            "items": [
+                _project(row, _JELLYFIN_USER)
+                for row in payload
+                if isinstance(row, dict)
+            ],
+            "upstream_truncated": False,
         }
 
 
