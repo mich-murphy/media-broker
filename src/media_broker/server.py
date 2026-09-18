@@ -182,6 +182,11 @@ def _register_history_tools(mcp: FastMCP, client: MediaClient) -> None:
     """Register the always-on playback-history read tools."""
 
     @mcp.tool(annotations=_READ_ONLY)
+    async def jellyfin_users() -> dict[str, Any]:
+        """List Jellyfin users as id/name pairs for jellyfin_play_history."""
+        return await _guarded(client.jellyfin_users())
+
+    @mcp.tool(annotations=_READ_ONLY)
     async def jellyfin_play_history(
         user_id: JellyfinUserId,
         media_type: JellyfinMediaType,
