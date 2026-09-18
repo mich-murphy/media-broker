@@ -19,7 +19,6 @@ from media_broker.adapters import (
     MediaClient,
     ParameterError,
     UpstreamError,
-    _issue_confirmation,
 )
 from media_broker.config import (
     ConfigError,
@@ -82,10 +81,15 @@ def settings() -> Settings:
 async def make_client(settings: Settings) -> AsyncIterator[ClientFactory]:
     clients: list[MediaClient] = []
 
-    def factory(handler: Handler, **overrides: Any) -> MediaClient:
-        client = MediaClient(
-            replace(settings, **overrides), httpx.MockTransport(handler)
+    def factory(
+        source: Handler | httpx.AsyncBaseTransport, **overrides: Any
+    ) -> MediaClient:
+        transport = (
+            source
+            if isinstance(source, httpx.AsyncBaseTransport)
+            else httpx.MockTransport(source)
         )
+        client = MediaClient(replace(settings, **overrides), transport)
         clients.append(client)
         return client
 
@@ -1103,7 +1107,7 @@ CANDIDATES = {
     "radarr": RADARR_CANDIDATE,
     "lidarr": LIDARR_CANDIDATE,
 }
-EXPECTED_ADD_BODIES = {
+EXPECTED_ADD_BODIES: dict[str, dict[str, Any]] = {
     "sonarr": {
         "title": "Example Show",
         "titleSlug": "example-show",
@@ -1154,13 +1158,12 @@ EXPECTED_ADD_BODIES = {
 def write_backend(
     candidates: list[Any],
     *,
-    seen: list[httpx.Request],
     item: dict[str, Any] | None = None,
     profiles: list[dict[str, Any]] | None = None,
     folders: list[dict[str, Any]] | None = None,
     metadata: list[dict[str, Any]] | None = None,
 ) -> Handler:
-    """A routed write-capable fake upstream that records every request."""
+    """A routed write-capable fake upstream sharing every write fixture."""
     record = {"id": 42, "title": "Item"} if item is None else item
     data = {
         "/lookup": candidates,
@@ -1170,7 +1173,6 @@ def write_backend(
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
         payload = next(
             (
                 body
@@ -1185,6 +1187,8 @@ def write_backend(
             return httpx.Response(200)
         if request.method == "PUT":
             return httpx.Response(200, json=record | {"monitored": False})
+        if request.method == "POST":
+            return httpx.Response(200, json=record | {"id": 42})
         return httpx.Response(200, json=record)
 
     return handler
@@ -1193,10 +1197,13 @@ def write_backend(
 async def test_search_candidates_are_projected_and_bounded(
     make_client: ClientFactory,
 ) -> None:
-    seen: list[httpx.Request] = []
-    rows = [RADARR_CANDIDATE | {"id": 5}, RADARR_CANDIDATE | {"junk": True}, "junk"]
-    client = make_client(write_backend(rows, seen=seen))
-    result = await client.search_candidates("radarr", "example", 1)
+    transport = RecordingTransport(
+        write_backend(
+            [RADARR_CANDIDATE | {"id": 5}, RADARR_CANDIDATE | {"junk": True}, "junk"]
+        )
+    )
+    seen = transport.requests
+    result = await make_client(transport).search_candidates("radarr", "example", 1)
     assert result == {
         "service": "radarr",
         "items": [
@@ -1217,34 +1224,37 @@ async def test_search_candidates_are_projected_and_bounded(
     assert "radarr-key" not in str(seen[0].url)
 
 
+SEARCH_OPTIONS = {
+    "sonarr": "searchForMissingEpisodes",
+    "radarr": "searchForMovie",
+    "lidarr": "searchForMissingAlbums",
+}
+
+
 @pytest.mark.parametrize("service", ["sonarr", "radarr", "lidarr"])
-async def test_request_media_adds_a_broker_built_record_and_searches(
-    make_client: ClientFactory, service: ArrService
+@pytest.mark.parametrize("search", [True, False])
+async def test_request_media_adds_a_broker_built_record(
+    make_client: ClientFactory, service: ArrService, search: bool
 ) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([CANDIDATES[service]], seen=seen))
-    result = await client.request_media(
-        service, EXTERNAL_IDS[service], 7, "/media/", True
+    """The broker builds the add body alone; search_on_add only toggles searching."""
+    transport = RecordingTransport(write_backend([CANDIDATES[service]]))
+    seen = transport.requests
+    result = await make_client(transport).request_media(
+        service, EXTERNAL_IDS[service], 7, "/media/", search
     )
     post = next(request for request in seen if request.method == "POST")
+    expected = EXPECTED_ADD_BODIES[service]
     assert post.url.path == ADD_RESOURCES[service]
-    assert json.loads(post.content) == EXPECTED_ADD_BODIES[service]
+    assert json.loads(post.content) == expected | {
+        "addOptions": expected["addOptions"] | {SEARCH_OPTIONS[service]: search}
+    }
     assert post.headers["x-api-key"] == f"{service}-key"
     assert f"{service}-key" not in str(post.url)
-    assert seen[0].url.params["term"] == LOOKUP_TERMS[service]
+    lookup = next(r for r in seen if r.url.path.endswith("/lookup"))
+    assert lookup.url.params["term"] == LOOKUP_TERMS[service]
     assert result["item"]["id"] == 42
     assert result["item"]["in_library"] is True
-    assert result["search_on_add"] is True
-
-
-async def test_request_media_can_monitor_without_an_immediate_search(
-    make_client: ClientFactory,
-) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([RADARR_CANDIDATE], seen=seen))
-    await client.request_media("radarr", "603", 7, "/media", False)
-    post = next(request for request in seen if request.method == "POST")
-    assert json.loads(post.content)["addOptions"] == {"searchForMovie": False}
+    assert result["search_on_add"] is search
 
 
 @pytest.mark.parametrize(
@@ -1272,23 +1282,22 @@ async def test_request_media_rejects_malformed_external_ids_before_any_call(
 async def test_request_media_rejects_items_already_in_the_library(
     make_client: ClientFactory,
 ) -> None:
-    seen: list[httpx.Request] = []
     rows = [SONARR_CANDIDATE | {"id": 9}]
+    transport = RecordingTransport(write_backend(rows))
+    seen = transport.requests
     with pytest.raises(ParameterError, match="already in the library"):
-        await make_client(write_backend(rows, seen=seen)).request_media(
-            "sonarr", "81189", 7, "/media", True
-        )
-    assert [request.url.path for request in seen] == ["/api/v3/series/lookup"]
+        await make_client(transport).request_media("sonarr", "81189", 7, "/media", True)
+    assert all(request.method == "GET" for request in seen)
 
 
 async def test_request_media_requires_a_candidate_match(
     make_client: ClientFactory,
 ) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([RADARR_CANDIDATE], seen=seen))
+    transport = RecordingTransport(write_backend([RADARR_CANDIDATE]))
+    seen = transport.requests
     with pytest.raises(ParameterError, match="no upstream candidate"):
-        await client.request_media("sonarr", "81189", 7, "/media", True)
-    assert [request.method for request in seen] == ["GET"]
+        await make_client(transport).request_media("sonarr", "81189", 7, "/media", True)
+    assert all(request.method == "GET" for request in seen)
 
 
 @pytest.mark.parametrize(
@@ -1302,32 +1311,31 @@ async def test_request_media_requires_a_candidate_match(
 async def test_request_media_validates_local_configuration_before_adding(
     make_client: ClientFactory, overrides: dict[str, Any], message: str
 ) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([SONARR_CANDIDATE], seen=seen, **overrides))
+    transport = RecordingTransport(write_backend([SONARR_CANDIDATE], **overrides))
+    seen = transport.requests
     with pytest.raises(ParameterError, match=message):
-        await client.request_media("sonarr", "81189", 7, "/media", True)
+        await make_client(transport).request_media("sonarr", "81189", 7, "/media", True)
     assert all(request.method == "GET" for request in seen)
 
 
 async def test_lidarr_requests_use_the_lowest_metadata_profile(
     make_client: ClientFactory,
 ) -> None:
-    seen: list[httpx.Request] = []
-    metadata = [{"id": 3}, {"id": 2}]
-    client = make_client(
-        write_backend([LIDARR_CANDIDATE], seen=seen, metadata=metadata)
+    transport = RecordingTransport(
+        write_backend([LIDARR_CANDIDATE], metadata=[{"id": 3}, {"id": 2}])
     )
-    await client.request_media("lidarr", MBID, 7, "/media", True)
+    seen = transport.requests
+    await make_client(transport).request_media("lidarr", MBID, 7, "/media", True)
     post = next(request for request in seen if request.method == "POST")
     assert json.loads(post.content)["metadataProfileId"] == 2
 
 
 async def test_sonarr_requests_need_season_metadata(make_client: ClientFactory) -> None:
-    seen: list[httpx.Request] = []
     candidate = {k: v for k, v in SONARR_CANDIDATE.items() if k != "seasons"}
-    client = make_client(write_backend([candidate], seen=seen))
+    transport = RecordingTransport(write_backend([candidate]))
+    seen = transport.requests
     with pytest.raises(ParameterError, match="season"):
-        await client.request_media("sonarr", "81189", 7, "/media", True)
+        await make_client(transport).request_media("sonarr", "81189", 7, "/media", True)
     assert all(request.method == "GET" for request in seen)
 
 
@@ -1342,9 +1350,9 @@ async def test_unmonitor_media_merges_and_returns_one_projection(
         "path": "/media/Show",
         "secret": "upstream-only",
     }
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([], seen=seen, item=item))
-    result = await client.unmonitor_media("sonarr", 3)
+    transport = RecordingTransport(write_backend([], item=item))
+    seen = transport.requests
+    result = await make_client(transport).unmonitor_media("sonarr", 3)
     put = next(request for request in seen if request.method == "PUT")
     assert put.url.path == "/api/v3/series/3"
     assert json.loads(put.content) == item | {"monitored": False}
@@ -1354,47 +1362,42 @@ async def test_unmonitor_media_merges_and_returns_one_projection(
     }
 
 
+@pytest.mark.parametrize(("delete_files", "flag"), [(True, "true"), (False, "false")])
 async def test_delete_media_is_a_two_phase_confirmed_operation(
-    make_client: ClientFactory,
+    make_client: ClientFactory, delete_files: bool, flag: str
 ) -> None:
     item = {"id": 5, "title": "Old Show", "monitored": True, "path": "/media/Old Show"}
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([], seen=seen, item=item))
-    preview = await client.delete_media("sonarr", 5, True)
+    transport = RecordingTransport(write_backend([], item=item))
+    seen = transport.requests
+    client = make_client(transport)
+    preview = await client.delete_media("sonarr", 5, delete_files)
     assert preview["confirmation_required"] is True
     assert preview["item"] == {"id": 5, "title": "Old Show", "monitored": True}
-    assert preview["delete_files"] is True
+    assert preview["delete_files"] is delete_files
     assert preview["confirmation_expires_at"] > int(time.time())
     assert [request.method for request in seen] == ["GET"]
-    completed = await client.delete_media("sonarr", 5, True, preview["confirmation"])
+    completed = await client.delete_media(
+        "sonarr", 5, delete_files, preview["confirmation"]
+    )
     assert completed == {
         "deleted": True,
         "service": "sonarr",
         "item": {"id": 5, "title": "Old Show", "monitored": True},
-        "delete_files": True,
+        "delete_files": delete_files,
     }
     assert [request.method for request in seen] == ["GET", "GET", "DELETE"]
     delete = seen[-1]
     assert delete.url.path == "/api/v3/series/5"
-    assert delete.url.params["deleteFiles"] == "true"
+    assert delete.url.params["deleteFiles"] == flag
     assert delete.url.params["addImportListExclusion"] == "false"
 
 
-async def test_delete_media_default_keeps_files_on_disk(
-    make_client: ClientFactory,
-) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([], seen=seen, item={"id": 5, "title": "Old"}))
-    preview = await client.delete_media("sonarr", 5, False)
-    await client.delete_media("sonarr", 5, False, preview["confirmation"])
-    assert seen[-1].url.params["deleteFiles"] == "false"
-
-
 async def test_delete_media_rejects_unbound_tampered_or_expired_confirmation(
-    make_client: ClientFactory,
+    make_client: ClientFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    seen: list[httpx.Request] = []
-    client = make_client(write_backend([], seen=seen, item={"id": 5, "title": "Old"}))
+    transport = RecordingTransport(write_backend([], item={"id": 5, "title": "Old"}))
+    seen = transport.requests
+    client = make_client(transport)
     preview = await client.delete_media("sonarr", 5, True)
     token = preview["confirmation"]
     with pytest.raises(ParameterError, match="confirmation"):
@@ -1403,47 +1406,20 @@ async def test_delete_media_rejects_unbound_tampered_or_expired_confirmation(
         await client.delete_media("radarr", 5, True, token)
     with pytest.raises(ParameterError, match="confirmation"):
         await client.delete_media("sonarr", 5, True, token + "tampered")
-    stale = _issue_confirmation(
-        TOKEN, "arr_delete_media:sonarr:5:1", int(time.time()) - 1
-    )
+    # Simulate the token's TTL elapsing without sleeping.
+    monkeypatch.setattr("media_broker.adapters._CONFIRM_TTL_SECONDS", -1)
     with pytest.raises(ParameterError, match="expired"):
-        await client.delete_media("sonarr", 5, True, stale)
-    assert len(seen) == 5
+        await client.delete_media("sonarr", 5, True, token)
     assert all(request.method == "GET" for request in seen)
 
 
 # --- gated MCP write surface --------------------------------------------------
 
 
-def _write_data(path: str) -> Any:
-    if path.endswith("/lookup"):
-        return [SONARR_CANDIDATE]
-    if path.endswith("/qualityprofile"):
-        return [{"id": 7, "name": "HD"}]
-    if path.endswith("/rootfolder"):
-        return [{"path": "/media"}]
-    if path.endswith("/metadataprofile"):
-        return [{"id": 1}]
-    return None
-
-
-def write_upstreams(request: httpx.Request) -> httpx.Response:
-    """A routed write-enabled fake upstream with one candidate and one item."""
-    seen_data = _write_data(request.url.path)
-    if seen_data is not None:
-        return httpx.Response(200, json=seen_data)
-    if request.method == "DELETE":
-        return httpx.Response(200)
-    if request.method == "PUT":
-        return httpx.Response(200, json={"id": 3, "title": "Item", "monitored": False})
-    if request.method == "POST":
-        return httpx.Response(200, json={"id": 42, "title": "Item"})
-    return httpx.Response(200, json={"id": 3, "title": "Item", "monitored": True})
-
-
 @pytest.fixture
 def write_upstream() -> RecordingTransport:
-    return RecordingTransport(write_upstreams)
+    item = {"id": 3, "title": "Item", "monitored": True}
+    return RecordingTransport(write_backend([SONARR_CANDIDATE], item=item))
 
 
 @pytest.fixture
@@ -1578,7 +1554,7 @@ def test_delete_media_flows_over_streamable_http_with_confirmation(
         ("arr_delete_media", {"service": "sonarr", "item_id": 2**31}, "item_id"),
         (
             "arr_delete_media",
-            {"service": "sonarr", "item_id": 3, "confirmation": "x" * 65},
+            {"service": "sonarr", "item_id": 3, "confirmation": "x" * 129},
             "confirmation",
         ),
     ],

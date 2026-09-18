@@ -52,9 +52,9 @@ files; it is reversible and needs no confirmation.
 
 `arr_delete_media` removes one item and is destructive. It always runs in two
 phases: the first call returns a preview of the projected item plus a
-five-minute HMAC confirmation token bound to the exact action (service, item
-id, and file mode), and only a second call carrying that token executes the
-delete. `delete_files=false` (the default) removes the item but keeps files on
+five-minute signed confirmation token (`itsdangerous`) bound to the exact
+action (service, item id, and file mode), and only a second call carrying
+that token executes the delete. `delete_files=false` (the default) removes the item but keeps files on
 disk; `delete_files=true` removes files too. Import-list exclusions are never
 added, so exclusion lists are managed by the operator, not the broker.
 
@@ -111,7 +111,8 @@ is reported as unknown, not false.
 Tool argument bounds (page 1-100000, page size 1-100, search text up to 200
 characters, strict `YYYY-MM-DD` dates, non-negative Tautulli `user_id`, Jellyfin
 timezone offsets from -14 to 14 hours, external ids up to 64 characters, item
-and profile ids within int32, candidate lists of at most 100) are declared in
+and profile ids within int32, candidate lists of at most 100, confirmation
+tokens up to 128 characters) are declared in
 each tool's input schema, so clients see them before calling. Rejected
 arguments, upstream failures, and unexpected errors are all reported through the
 MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys

@@ -33,6 +33,10 @@ class Upstream:
     api_key: str = field(repr=False)
     api_version: str
 
+    def api(self, *parts: str | int) -> str:
+        """Join path segments under the pinned API version into a full URL."""
+        return self.base_url + "/api/" + "/".join((self.api_version, *map(str, parts)))
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:

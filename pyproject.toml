@@ -5,6 +5,7 @@ description = "Controlled MCP broker for local media services"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "httpx==0.28.1",
+    "itsdangerous>=2.2",
     "mcp==1.28.1",
     "pydantic==2.13.5",
     "starlette==1.6.0",

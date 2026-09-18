@@ -49,7 +49,7 @@ Limit = Annotated[int, Field(ge=1, le=100)]
 ExternalId = Annotated[str, Field(min_length=1, max_length=64)]
 Identifier = Annotated[int, Field(ge=1, le=2_147_483_647)]
 RootPath = Annotated[str, Field(min_length=1, max_length=1024)]
-Confirmation = Annotated[str | None, Field(max_length=64)]
+Confirmation = Annotated[str | None, Field(max_length=128)]
 
 
 class BearerMiddleware:
