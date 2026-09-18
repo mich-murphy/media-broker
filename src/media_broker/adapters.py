@@ -8,8 +8,8 @@ a short-lived signed confirmation bound to the exact action parameters.
 import asyncio
 import json
 import logging
-import re
 import time
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -29,9 +29,7 @@ _MAX_PROJECTED_STRING = 1024
 _MAX_REQUEST_BYTES = 262_144
 _CONFIRM_TTL_SECONDS = 300
 _JELLYFIN_FILTERS = {"movie": "Movie", "episode": "Episode", "track": "Audio"}
-_JELLYFIN_USER_ID = re.compile(r"^[0-9a-fA-F]{32}$")
-_NUMERIC_IDENTIFIER = re.compile(r"^[1-9]\d{0,9}$")
-_MUSICBRAINZ_ID = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
+_HEX = frozenset("0123456789abcdefABCDEF")
 _DELETE_ACTION = "arr_delete_media"
 # Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
 _WATCHED_STATUSES = frozenset({0, 0.25, 0.5, 0.75, 1})
@@ -133,12 +131,27 @@ def _completion(value: Any) -> bool | None:
     return None if status not in _WATCHED_STATUSES else status == 1
 
 
+def is_jellyfin_user_id(value: str) -> bool:
+    """Playback Reporting rows are keyed by exactly 32 hex characters."""
+    return len(value) == 32 and all(char in _HEX for char in value)
+
+
 def _lidarr_id(value: str) -> bool:
-    return bool(_MUSICBRAINZ_ID.fullmatch(value))
+    """Accept only the dashed canonical MusicBrainz UUID form (any case)."""
+    try:
+        return str(uuid.UUID(value)).casefold() == value.casefold()
+    except ValueError:
+        return False
 
 
 def _numeric_catalog_id(value: str) -> bool:
-    return bool(_NUMERIC_IDENTIFIER.fullmatch(value)) and int(value) <= 2_147_483_647
+    """Catalog ids are decimal strings without leading zeros, capped to int32."""
+    return (
+        value.isascii()
+        and value.isdigit()
+        and not value.startswith("0")
+        and int(value) <= 2_147_483_647
+    )
 
 
 def _sonarr_seasons(candidate: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -600,8 +613,8 @@ class MediaClient:
     async def history(
         self,
         media_type: TautulliMediaType,
-        start_date: str,
-        end_date: str,
+        start_date: date,
+        end_date: date,
         page: int,
         page_size: int,
         user_id: int | None = None,
@@ -661,15 +674,15 @@ class MediaClient:
         self,
         user_id: str,
         media_type: JellyfinMediaType,
-        start_date: str,
-        end_date: str,
+        start_date: date,
+        end_date: date,
         page: int,
         page_size: int,
         timezone_offset: float,
     ) -> dict[str, Any]:
         """Return projected Playback Reporting rows, fetched one day at a time."""
         start, end = _date_range(start_date, end_date)
-        if not _JELLYFIN_USER_ID.fullmatch(user_id):
+        if not is_jellyfin_user_id(user_id):
             raise ParameterError("user_id must contain exactly 32 hex characters")
         if not -14 <= timezone_offset <= 14:
             raise ParameterError("timezone_offset must be between -14 and 14 hours")
@@ -749,11 +762,8 @@ def _jellyfin_played_at(local_date: date, value: Any) -> str | None:
     return played_at if len(played_at) <= _MAX_PROJECTED_STRING else None
 
 
-def _date_range(start_value: str, end_value: str) -> tuple[date, date]:
-    try:
-        start, end = date.fromisoformat(start_value), date.fromisoformat(end_value)
-    except ValueError as exc:
-        raise ParameterError("dates must be valid YYYY-MM-DD calendar dates") from exc
+def _date_range(start: date, end: date) -> tuple[date, date]:
+    """Bound an inclusive window of validated calendar dates to 31 days."""
     if not 0 <= (end - start).days <= 30:
         raise ParameterError(
             "end_date must be on or after start_date and within 31 inclusive days"

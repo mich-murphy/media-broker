@@ -2,6 +2,7 @@
 
 import secrets
 from collections.abc import Awaitable, Iterable
+from datetime import date
 from typing import Annotated, Any
 
 import httpx
@@ -10,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import AfterValidator, BeforeValidator, Field
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -21,6 +22,7 @@ from .adapters import (
     ParameterError,
     TautulliMediaType,
     UpstreamError,
+    is_jellyfin_user_id,
 )
 from .config import Settings, load_settings
 
@@ -36,13 +38,30 @@ _UNMONITOR = ToolAnnotations(
 _DESTRUCTIVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
 )
+
+
+def _iso_date(value: Any) -> Any:
+    """Accept JSON strings only; pydantic then coerces to a calendar date."""
+    if not isinstance(value, str):
+        raise ValueError("must be an ISO 8601 calendar date")
+    return value
+
+
+def _hex_user_id(value: str) -> str:
+    if not is_jellyfin_user_id(value):
+        raise ValueError("must contain exactly 32 hexadecimal characters")
+    return value
+
+
 # Argument bounds live in the tool schema so callers see them before calling.
 Page = Annotated[int, Field(ge=1, le=100_000)]
 PageSize = Annotated[int, Field(ge=1, le=100)]
 Search = Annotated[str | None, Field(max_length=200)]
-IsoDate = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+IsoDate = Annotated[date, BeforeValidator(_iso_date)]
 UserId = Annotated[int | None, Field(ge=0, le=2_147_483_647)]
-JellyfinUserId = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{32}$")]
+JellyfinUserId = Annotated[
+    str, Field(min_length=32, max_length=32), AfterValidator(_hex_user_id)
+]
 TimezoneOffset = Annotated[float, Field(ge=-14, le=14)]
 Query = Annotated[str, Field(min_length=1, max_length=200)]
 Limit = Annotated[int, Field(ge=1, le=100)]

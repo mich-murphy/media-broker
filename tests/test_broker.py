@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -438,7 +439,7 @@ async def test_history_request_shape_and_projection(make_client: ClientFactory) 
         return history_reply([row, other_user, other_type])(request)
 
     result = await make_client(handler).history(
-        "episode", "2024-01-01", "2024-01-31", 1, 10, 7
+        "episode", date(2024, 1, 1), date(2024, 1, 31), 1, 10, 7
     )
     assert result["items"] == [
         {
@@ -488,7 +489,7 @@ async def test_history_completion_domain(
     make_client: ClientFactory, status: object, completed: bool | None
 ) -> None:
     client = make_client(history_reply([{"watched_status": status}]))
-    result = await client.history("track", "2024-01-01", "2024-01-01", 1, 1)
+    result = await client.history("track", date(2024, 1, 1), date(2024, 1, 1), 1, 1)
     assert result["items"][0]["completed"] is completed
 
 
@@ -512,7 +513,7 @@ async def test_history_requires_a_well_formed_success_envelope(
 ) -> None:
     with pytest.raises(UpstreamError, match=message) as error:
         await make_client(reply(payload)).history(
-            "movie", "2024-01-01", "2024-01-01", 1, 1
+            "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1
         )
     assert "private" not in str(error.value)
 
@@ -537,7 +538,7 @@ async def test_history_pagination_never_trusts_an_inconsistent_total(
     reported_total: int | None,
 ) -> None:
     client = make_client(history_reply([{"title": "Movie"}] * rows, total))
-    result = await client.history("movie", "2024-01-01", "2024-01-01", page, 2)
+    result = await client.history("movie", date(2024, 1, 1), date(2024, 1, 1), page, 2)
     pagination = result["pagination"]
     assert pagination["has_more"] is has_more
     assert pagination["upstream_truncated"] is truncated
@@ -547,16 +548,15 @@ async def test_history_pagination_never_trusts_an_inconsistent_total(
 @pytest.mark.parametrize(
     ("start", "end", "message"),
     [
-        ("2024-01-01", "2024-02-01", "31 inclusive days"),
-        ("2024-01-02", "2024-01-01", "on or after"),
-        ("2024-02-30", "2024-02-30", "calendar dates"),
+        (date(2024, 1, 1), date(2024, 2, 1), "31 inclusive days"),
+        (date(2024, 1, 2), date(2024, 1, 1), "on or after"),
     ],
 )
 async def test_history_date_range_bounds(
-    make_client: ClientFactory, start: str, end: str, message: str
+    make_client: ClientFactory, start: date, end: date, message: str
 ) -> None:
     client = make_client(history_reply([]))
-    assert (await client.history("movie", "2024-01-01", "2024-01-31", 1, 1))[
+    assert (await client.history("movie", date(2024, 1, 1), date(2024, 1, 31), 1, 1))[
         "items"
     ] == []
     with pytest.raises(ParameterError, match=message):
@@ -594,7 +594,7 @@ async def test_jellyfin_history_iterates_dates_and_projects_only_allowed_fields(
         )
 
     result = await make_client(handler).jellyfin_history(
-        JELLYFIN_USER, "episode", "2024-01-01", "2024-01-02", 1, 10, 5.5
+        JELLYFIN_USER, "episode", date(2024, 1, 1), date(2024, 1, 2), 1, 10, 5.5
     )
     assert [request.url.path for request in seen] == [
         f"/user_usage_stats/{JELLYFIN_USER}/2024-01-01/GetItems",
@@ -646,7 +646,7 @@ async def test_jellyfin_media_type_filters(
 
     client = make_client(handler)
     await client.jellyfin_history(
-        JELLYFIN_USER, media_type, "2024-01-01", "2024-01-01", 1, 1, 0
+        JELLYFIN_USER, media_type, date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
     )
     assert dict(seen[0].url.params) == {
         "filter": expected_filter,
@@ -670,7 +670,9 @@ async def test_jellyfin_history_bounds_projected_strings(
                 }
             ]
         )
-    ).jellyfin_history(JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0)
+    ).jellyfin_history(
+        JELLYFIN_USER, "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
+    )
     item = result["items"][0]
     assert item["jellyfin_item_id"] is None
     assert item["jellyfin_history_id"] is None
@@ -694,7 +696,9 @@ async def test_jellyfin_history_scalar_validation_and_missing_fields(
                 }
             ]
         )
-    ).jellyfin_history(JELLYFIN_USER, "track", "2024-01-01", "2024-01-01", 1, 1, 0)
+    ).jellyfin_history(
+        JELLYFIN_USER, "track", date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
+    )
     assert result["items"] == [
         {
             "jellyfin_user_id": JELLYFIN_USER,
@@ -729,7 +733,7 @@ async def test_jellyfin_history_local_pagination(
         )
 
     result = await make_client(handler).jellyfin_history(
-        JELLYFIN_USER, "movie", "2024-01-01", "2024-01-02", 2, 2, 0
+        JELLYFIN_USER, "movie", date(2024, 1, 1), date(2024, 1, 2), 2, 2, 0
     )
     assert [item["title"] for item in result["items"]] == ["2024-01-02-0"]
     assert result["pagination"] == {
@@ -755,7 +759,7 @@ async def test_jellyfin_history_rejects_malformed_day_results(
 ) -> None:
     with pytest.raises(UpstreamError, match=message):
         await make_client(reply(payload)).jellyfin_history(
-            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+            JELLYFIN_USER, "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
         )
 
 
@@ -764,7 +768,7 @@ async def test_jellyfin_history_rejects_excess_aggregate_rows(
 ) -> None:
     with pytest.raises(UpstreamError, match="too many Jellyfin history rows"):
         await make_client(reply([{}] * 10_001)).jellyfin_history(
-            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+            JELLYFIN_USER, "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
         )
 
 
@@ -778,7 +782,7 @@ async def test_jellyfin_history_rejects_unsafe_arguments(
     message = "user_id" if user_id != JELLYFIN_USER else "timezone_offset"
     with pytest.raises(ParameterError, match=message):
         await make_client(reply([])).jellyfin_history(
-            user_id, "movie", "2024-01-01", "2024-01-01", 1, 1, timezone_offset
+            user_id, "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1, timezone_offset
         )
 
 
@@ -787,7 +791,7 @@ async def test_jellyfin_history_propagates_authorization_failure(
 ) -> None:
     with pytest.raises(UpstreamError, match="HTTP 403"):
         await make_client(reply({"private": "detail"}, 403)).jellyfin_history(
-            JELLYFIN_USER, "movie", "2024-01-01", "2024-01-01", 1, 1, 0
+            JELLYFIN_USER, "movie", date(2024, 1, 1), date(2024, 1, 1), 1, 1, 0
         )
 
 
@@ -913,10 +917,16 @@ def test_tools_are_discoverable_read_only_and_schema_bounded(mcp: TestClient) ->
         100,
     )
     history = tools["tautulli_play_history"]["inputSchema"]["properties"]
-    assert history["start_date"]["pattern"] == r"^\d{4}-\d{2}-\d{2}$"
+    assert (history["start_date"]["type"], history["start_date"]["format"]) == (
+        "string",
+        "date",
+    )
     jellyfin = tools["jellyfin_play_history"]["inputSchema"]["properties"]
     assert jellyfin["media_type"]["enum"] == ["movie", "episode", "track"]
-    assert jellyfin["user_id"]["pattern"] == r"^[0-9a-fA-F]{32}$"
+    assert (
+        jellyfin["user_id"]["minLength"],
+        jellyfin["user_id"]["maxLength"],
+    ) == (32, 32)
     assert (
         jellyfin["timezone_offset"]["minimum"],
         jellyfin["timezone_offset"]["maximum"],
@@ -984,6 +994,15 @@ def test_each_tool_answers_over_streamable_http(
                 "media_type": "movie",
                 "start_date": "2024-1-01",
                 "end_date": "2024-01-01",
+            },
+            "start_date",
+        ),
+        (
+            "tautulli_play_history",
+            {
+                "media_type": "movie",
+                "start_date": "2024-02-30",
+                "end_date": "2024-03-01",
             },
             "start_date",
         ),
