@@ -1276,6 +1276,32 @@ async def test_request_media_adds_a_broker_built_record(
     assert result["search_on_add"] is search
 
 
+async def test_writes_send_a_json_content_type_but_reads_do_not(
+    make_client: ClientFactory,
+) -> None:
+    """Arr rejects write bodies without Content-Type: application/json (HTTP 415)."""
+    item = {
+        "id": 3,
+        "title": "Show",
+        "monitored": True,
+        "seasons": [],
+        "path": "/media/Show",
+    }
+    transport = RecordingTransport(write_backend([SONARR_CANDIDATE], item=item))
+    seen = transport.requests
+    client = make_client(transport)
+    await client.request_media("sonarr", "81189", 7, "/media", True)
+    await client.unmonitor_media("sonarr", 3)
+    writes = [request for request in seen if request.method in {"POST", "PUT"}]
+    assert len(writes) == 2
+    for request in writes:
+        assert request.headers["content-type"] == "application/json"
+    reads = [request for request in seen if request.method == "GET"]
+    assert reads
+    for request in reads:
+        assert "content-type" not in request.headers
+
+
 @pytest.mark.parametrize(
     ("service", "external_id"),
     [

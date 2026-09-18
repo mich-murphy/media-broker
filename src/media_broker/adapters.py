@@ -356,6 +356,8 @@ class MediaClient:
             else {"X-Api-Key": upstream.api_key}
         )
         content = None if request_body is None else _bounded_request(request_body)
+        if content is not None:
+            headers["Content-Type"] = "application/json"
         try:
             async with (
                 asyncio.timeout(self.settings.timeout_seconds),
