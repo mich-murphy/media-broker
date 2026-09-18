@@ -1,7 +1,7 @@
 [project]
 name = "media-broker"
-version = "0.1.0"
-description = "Read-only MCP broker for local media services"
+version = "0.2.0"
+description = "Controlled MCP broker for local media services"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "httpx==0.28.1",

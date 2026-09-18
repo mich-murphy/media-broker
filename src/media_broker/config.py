@@ -1,5 +1,8 @@
 """Configuration and secret-file handling for the media broker."""
 
+# Write tools are opt-in: requests enable brokered adds and unmonitoring, and
+# deletes enable the two-phase destructive media removal tool.
+
 import os
 import re
 from collections.abc import Callable
@@ -43,6 +46,8 @@ class Settings:
     port: int
     timeout_seconds: float = 10.0
     max_response_bytes: int = 2_000_000
+    enable_requests: bool = False
+    enable_deletes: bool = False
 
 
 def _required(name: str) -> str:
@@ -190,4 +195,6 @@ def load_settings() -> Settings:
         max_response_bytes=_number(
             "MEDIA_BROKER_MAX_RESPONSE_BYTES", 2_000_000, 1_000, 50_000_000
         ),
+        enable_requests=_flag("MEDIA_BROKER_ENABLE_REQUESTS"),
+        enable_deletes=_flag("MEDIA_BROKER_ENABLE_DELETES"),
     )

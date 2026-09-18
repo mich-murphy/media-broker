@@ -1,6 +1,6 @@
 # media-broker
 
-Read-only MCP broker for household media services. This repository owns the
+Controlled MCP broker for household media services. This repository owns the
 application source, its tests, and the published container image. The
 production deployment (Portainer stack, host firewall, secret files) is owned
 by the [`mich-murphy/home-infra`](https://github.com/mich-murphy/home-infra)
@@ -9,17 +9,54 @@ repository; see its `docs/hermes-media.md` for the deployment runbook.
 This project exposes a small MCP server over the official Python SDK's
 Streamable HTTP transport. The adapters target Sonarr 4.0.19 (API v3), Radarr
 6.3.0 (API v3), Lidarr 3.1.0 (API v1), Tautulli 2.18.1, and the Jellyfin
-Playback Reporting plugin (v19). It has five tools:
+Playback Reporting plugin (v19).
+
+Read tools, always available:
 
 - `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination)
 - `arr_quality_profiles`
 - `arr_root_folders`
+- `arr_search_candidates` (upstream catalog lookup; bounded, projected results)
 - `tautulli_play_history` (movie, episode, or track; inclusive maximum 31-day range and optional numeric user filter)
 - `jellyfin_play_history` (movie, episode, or track; inclusive maximum 31-day range, exact 32-hex-character user id, and local pagination)
 
-There are no write tools, generic upstream requests, approval endpoints, Seerr,
-or Jellyfin core endpoints. Arr APIs return arrays, so inventory pagination is
-performed after one bounded response and reports that fact honestly.
+Write tools, registered only when enabled:
+
+- `arr_request_media` and `arr_unmonitor_media` behind
+  `MEDIA_BROKER_ENABLE_REQUESTS=true`
+- `arr_delete_media` behind `MEDIA_BROKER_ENABLE_DELETES=true`
+
+There are no generic upstream requests, approval endpoints, Seerr, or Jellyfin
+core endpoints. Arr APIs return arrays, so inventory pagination is performed
+after one bounded response and reports that fact honestly. No read tool depends
+on Tautulli: any playback history source (Tautulli, the Jellyfin Playback
+Reporting plugin, or something else later) can drive request and cleanup
+decisions, because the write tools operate on Arr identifiers only.
+
+## Media requests
+
+`arr_request_media` takes a service, an external catalog identifier (TVDB id
+for Sonarr, TMDB id for Radarr, MusicBrainz artist UUID for Lidarr), a quality
+profile id, and a root folder path. The broker resolves the candidate itself
+through the upstream lookup endpoint, rejects external ids the catalog does not
+know, refuses duplicates already in the library, and requires both the quality
+profile and the root folder to exist upstream before posting one allow-listed
+add body. Lidarr adds use the lowest configured metadata profile id. By default
+the add starts searching for downloads immediately (`search_on_add=true`);
+pass `false` for monitor-only additions.
+
+## Library cleanup
+
+`arr_unmonitor_media` stops monitoring one item while keeping its metadata and
+files; it is reversible and needs no confirmation.
+
+`arr_delete_media` removes one item and is destructive. It always runs in two
+phases: the first call returns a preview of the projected item plus a
+five-minute HMAC confirmation token bound to the exact action (service, item
+id, and file mode), and only a second call carrying that token executes the
+delete. `delete_files=false` (the default) removes the item but keeps files on
+disk; `delete_files=true` removes files too. Import-list exclusions are never
+added, so exclusion lists are managed by the operator, not the broker.
 
 ## Local run
 
@@ -71,9 +108,10 @@ returned. Tautulli's numeric watched status of `1` means completed; `0`,
 `0.25`, `0.5`, and `0.75` mean incomplete. A missing or unrecognized status
 is reported as unknown, not false.
 
-Tool argument bounds (page 1-100000, page size 1-100, search up to 200
-characters, strict `YYYY-MM-DD` dates, non-negative Tautulli `user_id`, and
-Jellyfin timezone offsets from -14 to 14 hours) are declared in
+Tool argument bounds (page 1-100000, page size 1-100, search text up to 200
+characters, strict `YYYY-MM-DD` dates, non-negative Tautulli `user_id`, Jellyfin
+timezone offsets from -14 to 14 hours, external ids up to 64 characters, item
+and profile ids within int32, candidate lists of at most 100) are declared in
 each tool's input schema, so clients see them before calling. Rejected
 arguments, upstream failures, and unexpected errors are all reported through the
 MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys
@@ -111,6 +149,10 @@ upstreams using the `desktop-linux` Docker context; it creates and removes
 every resource it uses.
 
 MCP authentication proves possession of the configured bearer token, not human
-consent or authorization for a particular media action. The broker is read-only
-but upstream credentials and playback titles remain sensitive household data;
-keep it on a trusted loopback or private network and review client access.
+consent or authorization for a particular media action. The default surface
+is read-only; enabling the write gates extends that single credential to
+media requests and, with the delete gate, confirmed destructive removal.
+Upstream credentials and playback titles remain sensitive household data;
+keep the broker on a trusted loopback or private network, review client
+access, and enable the write gates only where clients are expected to mutate
+the library.
