@@ -55,7 +55,7 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized:
             self.send_error(401)
             return
-        if path.endswith("/series") or path.endswith("/movie") or path.endswith("/artist"):
+        if path.endswith("/series") or path.endswith("/movie") or path.endswith("/artist") or path.endswith("/lookup"):
             body = []
         elif path.endswith("/qualityprofile") or path.endswith("/rootfolder"):
             body = []
@@ -164,7 +164,8 @@ for request_body in (
     result = json.loads(text)["result"]
     if request_body["method"] == "tools/list":
         assert {tool["name"] for tool in result["tools"]} == {
-            "arr_library_inventory", "arr_quality_profiles", "arr_root_folders", "tautulli_play_history", "jellyfin_play_history"
+            "arr_library_inventory", "arr_quality_profiles", "arr_root_folders",
+            "arr_search_candidates", "tautulli_play_history", "jellyfin_play_history"
         }
     else:
         assert json.loads(result["content"][0]["text"])["items"] == []

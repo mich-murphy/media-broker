@@ -1,7 +1,9 @@
 """Configuration and secret-file handling for the media broker."""
 
+# Write tools are opt-in: requests enable brokered adds and unmonitoring, and
+# deletes enable the two-phase destructive media removal tool.
+
 import os
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +14,9 @@ class ConfigError(ValueError):
     """Raised when required broker configuration is absent or unsafe."""
 
 
-_BEARER_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,256}$")
+_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
 _UPSTREAM_API_VERSIONS = {
     "sonarr": "v3",
     "radarr": "v3",
@@ -30,6 +34,10 @@ class Upstream:
     api_key: str = field(repr=False)
     api_version: str
 
+    def api(self, *parts: str | int) -> str:
+        """Join path segments under the pinned API version into a full URL."""
+        return self.base_url + "/api/" + "/".join((self.api_version, *map(str, parts)))
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -43,6 +51,8 @@ class Settings:
     port: int
     timeout_seconds: float = 10.0
     max_response_bytes: int = 2_000_000
+    enable_requests: bool = False
+    enable_deletes: bool = False
 
 
 def _required(name: str) -> str:
@@ -168,7 +178,9 @@ def load_settings() -> Settings:
     authority = None if public else (f"{host}:{port}",)
     origin = None if public else (f"http://{host}:{port}",)
     bearer_token = _secret("MEDIA_BROKER_TOKEN_FILE")
-    if not _BEARER_TOKEN.fullmatch(bearer_token):
+    if not 32 <= len(bearer_token) <= 256 or any(
+        char not in _TOKEN_CHARS for char in bearer_token
+    ):
         raise ConfigError(
             "MEDIA_BROKER_TOKEN_FILE must contain 32-256 URL-safe characters"
         )
@@ -190,4 +202,6 @@ def load_settings() -> Settings:
         max_response_bytes=_number(
             "MEDIA_BROKER_MAX_RESPONSE_BYTES", 2_000_000, 1_000, 50_000_000
         ),
+        enable_requests=_flag("MEDIA_BROKER_ENABLE_REQUESTS"),
+        enable_deletes=_flag("MEDIA_BROKER_ENABLE_DELETES"),
     )

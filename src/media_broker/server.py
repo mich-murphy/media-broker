@@ -1,7 +1,8 @@
-"""MCP server exposing only bounded, read-only media inventory queries."""
+"""MCP server exposing bounded, projected inventory, history, and gated writes."""
 
 import secrets
 from collections.abc import Awaitable, Iterable
+from datetime import date
 from typing import Annotated, Any
 
 import httpx
@@ -10,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import AfterValidator, BeforeValidator, Field
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -21,20 +22,53 @@ from .adapters import (
     ParameterError,
     TautulliMediaType,
     UpstreamError,
+    is_jellyfin_user_id,
 )
 from .config import Settings, load_settings
 
 _READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+_WRITE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_UNMONITOR = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+
+
+def _iso_date(value: Any) -> Any:
+    """Accept JSON strings only; pydantic then coerces to a calendar date."""
+    if not isinstance(value, str):
+        raise ValueError("must be an ISO 8601 calendar date")
+    return value
+
+
+def _hex_user_id(value: str) -> str:
+    if not is_jellyfin_user_id(value):
+        raise ValueError("must contain exactly 32 hexadecimal characters")
+    return value
+
+
 # Argument bounds live in the tool schema so callers see them before calling.
 Page = Annotated[int, Field(ge=1, le=100_000)]
 PageSize = Annotated[int, Field(ge=1, le=100)]
 Search = Annotated[str | None, Field(max_length=200)]
-IsoDate = Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+IsoDate = Annotated[date, BeforeValidator(_iso_date)]
 UserId = Annotated[int | None, Field(ge=0, le=2_147_483_647)]
-JellyfinUserId = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{32}$")]
+JellyfinUserId = Annotated[
+    str, Field(min_length=32, max_length=32), AfterValidator(_hex_user_id)
+]
 TimezoneOffset = Annotated[float, Field(ge=-14, le=14)]
+Query = Annotated[str, Field(min_length=1, max_length=200)]
+Limit = Annotated[int, Field(ge=1, le=100)]
+ExternalId = Annotated[str, Field(min_length=1, max_length=64)]
+Identifier = Annotated[int, Field(ge=1, le=2_147_483_647)]
+RootPath = Annotated[str, Field(min_length=1, max_length=1024)]
+Confirmation = Annotated[str | None, Field(max_length=128)]
 
 
 class BearerMiddleware:
@@ -94,7 +128,10 @@ def create_mcp(settings: Settings, client: MediaClient) -> FastMCP:
     """Construct an SDK-backed MCP server whose tools accept only bounded input."""
     mcp = FastMCP(
         name="media-broker",
-        instructions="Read-only, projected media inventory and playback history.",
+        instructions=(
+            "Projected media inventory and playback history; media requests and "
+            "library cleanup are available only where explicitly enabled."
+        ),
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
@@ -124,6 +161,25 @@ def create_mcp(settings: Settings, client: MediaClient) -> FastMCP:
     async def arr_root_folders(service: ArrService) -> dict[str, Any]:
         """Return projected root-folder summaries for one Arr service."""
         return await _guarded(client.root_folders(service))
+
+    @mcp.tool(annotations=_READ_ONLY)
+    async def arr_search_candidates(
+        service: ArrService, query: Query, limit: Limit = 10
+    ) -> dict[str, Any]:
+        """Search one Arr catalog for requestable media by title or keyword."""
+        return await _guarded(client.search_candidates(service, query, limit))
+
+    _register_history_tools(mcp, client)
+    if settings.enable_requests:
+        _register_request_tools(mcp, client)
+    if settings.enable_deletes:
+        _register_delete_tools(mcp, client)
+
+    return mcp
+
+
+def _register_history_tools(mcp: FastMCP, client: MediaClient) -> None:
+    """Register the always-on playback-history read tools."""
 
     @mcp.tool(annotations=_READ_ONLY)
     async def jellyfin_play_history(
@@ -162,7 +218,51 @@ def create_mcp(settings: Settings, client: MediaClient) -> FastMCP:
             client.history(media_type, start_date, end_date, page, page_size, user_id)
         )
 
-    return mcp
+
+def _register_request_tools(mcp: FastMCP, client: MediaClient) -> None:
+    """Register brokered add and unmonitor tools behind the requests gate."""
+
+    @mcp.tool(annotations=_WRITE)
+    async def arr_request_media(
+        service: ArrService,
+        external_id: ExternalId,
+        quality_profile_id: Identifier,
+        root_folder_path: RootPath,
+        search_on_add: bool = True,
+    ) -> dict[str, Any]:
+        """Add one exact catalog item; searching for downloads is the default."""
+        return await _guarded(
+            client.request_media(
+                service,
+                external_id,
+                quality_profile_id,
+                root_folder_path,
+                search_on_add,
+            )
+        )
+
+    @mcp.tool(annotations=_UNMONITOR)
+    async def arr_unmonitor_media(
+        service: ArrService, item_id: Identifier
+    ) -> dict[str, Any]:
+        """Stop monitoring one library item, keeping metadata and files."""
+        return await _guarded(client.unmonitor_media(service, item_id))
+
+
+def _register_delete_tools(mcp: FastMCP, client: MediaClient) -> None:
+    """Register the two-phase destructive delete tool behind the deletes gate."""
+
+    @mcp.tool(annotations=_DESTRUCTIVE)
+    async def arr_delete_media(
+        service: ArrService,
+        item_id: Identifier,
+        delete_files: bool = False,
+        confirmation: Confirmation = None,
+    ) -> dict[str, Any]:
+        """Delete one library item behind a confirmed two-phase preview."""
+        return await _guarded(
+            client.delete_media(service, item_id, delete_files, confirmation)
+        )
 
 
 def build_app(
