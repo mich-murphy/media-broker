@@ -18,8 +18,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from .adapters import (
     ArrService,
     JellyfinMediaType,
+    LidarrService,
     MediaClient,
     ParameterError,
+    SonarrService,
     TautulliMediaType,
     UpstreamError,
     is_jellyfin_user_id,
@@ -69,6 +71,9 @@ ExternalId = Annotated[str, Field(min_length=1, max_length=64)]
 Identifier = Annotated[int, Field(ge=1, le=2_147_483_647)]
 RootPath = Annotated[str, Field(min_length=1, max_length=1024)]
 Confirmation = Annotated[str | None, Field(max_length=128)]
+SeasonSelection = Annotated[
+    list[Annotated[int, Field(ge=0, le=1000)]], Field(min_length=1, max_length=100)
+]
 
 
 class BearerMiddleware:
@@ -170,12 +175,31 @@ def create_mcp(settings: Settings, client: MediaClient) -> FastMCP:
         return await _guarded(client.search_candidates(service, query, limit))
 
     _register_history_tools(mcp, client)
+    _register_detail_read_tools(mcp, client)
     if settings.enable_requests:
         _register_request_tools(mcp, client)
     if settings.enable_deletes:
         _register_delete_tools(mcp, client)
 
     return mcp
+
+
+def _register_detail_read_tools(mcp: FastMCP, client: MediaClient) -> None:
+    """Register the always-on season and album detail read tools."""
+
+    @mcp.tool(annotations=_READ_ONLY)
+    async def arr_season_inventory(
+        service: SonarrService, item_id: Identifier
+    ) -> dict[str, Any]:
+        """Return per-season monitoring and episode file counts for one series."""
+        return await _guarded(client.season_inventory(service, item_id))
+
+    @mcp.tool(annotations=_READ_ONLY)
+    async def arr_album_inventory(
+        service: LidarrService, artist_id: Identifier
+    ) -> dict[str, Any]:
+        """Return per-album monitoring, file, and size details for one artist."""
+        return await _guarded(client.album_inventory(service, artist_id))
 
 
 def _register_history_tools(mcp: FastMCP, client: MediaClient) -> None:
@@ -234,8 +258,15 @@ def _register_request_tools(mcp: FastMCP, client: MediaClient) -> None:
         quality_profile_id: Identifier,
         root_folder_path: RootPath,
         search_on_add: bool = True,
+        seasons: SeasonSelection | None = None,
     ) -> dict[str, Any]:
-        """Add one exact catalog item; searching for downloads is the default."""
+        """Add one exact catalog item; searching for downloads is the default.
+
+        Sonarr accepts an optional seasons list so only those seasons are
+        monitored and searched. For a selective Lidarr album add: add with
+        search_on_add=false, then arr_album_inventory, arr_set_album_monitored,
+        and arr_search_item.
+        """
         return await _guarded(
             client.request_media(
                 service,
@@ -243,6 +274,7 @@ def _register_request_tools(mcp: FastMCP, client: MediaClient) -> None:
                 quality_profile_id,
                 root_folder_path,
                 search_on_add,
+                seasons,
             )
         )
 
@@ -251,7 +283,40 @@ def _register_request_tools(mcp: FastMCP, client: MediaClient) -> None:
         service: ArrService, item_id: Identifier
     ) -> dict[str, Any]:
         """Stop monitoring one library item, keeping metadata and files."""
-        return await _guarded(client.unmonitor_media(service, item_id))
+        return await _guarded(client.set_monitoring(service, item_id, False))
+
+    @mcp.tool(annotations=_UNMONITOR)
+    async def arr_monitor_media(
+        service: ArrService, item_id: Identifier
+    ) -> dict[str, Any]:
+        """Resume monitoring one library item, reversing arr_unmonitor_media."""
+        return await _guarded(client.set_monitoring(service, item_id, True))
+
+    @mcp.tool(annotations=_UNMONITOR)
+    async def arr_set_season_monitoring(
+        service: SonarrService,
+        item_id: Identifier,
+        seasons: SeasonSelection,
+        monitored: bool,
+    ) -> dict[str, Any]:
+        """Monitor or unmonitor a set of seasons on one series; reversible."""
+        return await _guarded(
+            client.set_season_monitoring(service, item_id, seasons, monitored)
+        )
+
+    @mcp.tool(annotations=_UNMONITOR)
+    async def arr_set_album_monitored(
+        service: LidarrService, album_id: Identifier, monitored: bool
+    ) -> dict[str, Any]:
+        """Monitor or unmonitor one Lidarr album; reversible in both directions."""
+        return await _guarded(client.set_album_monitored(service, album_id, monitored))
+
+    @mcp.tool(annotations=_WRITE)
+    async def arr_search_item(
+        service: ArrService, item_id: Identifier
+    ) -> dict[str, Any]:
+        """Queue an upstream search for one item's monitored missing content."""
+        return await _guarded(client.search_item(service, item_id))
 
 
 def _register_delete_tools(mcp: FastMCP, client: MediaClient) -> None:
@@ -263,10 +328,15 @@ def _register_delete_tools(mcp: FastMCP, client: MediaClient) -> None:
         item_id: Identifier,
         delete_files: bool = False,
         confirmation: Confirmation = None,
+        album_id: Identifier | None = None,
     ) -> dict[str, Any]:
-        """Delete one library item behind a confirmed two-phase preview."""
+        """Delete one library item behind a confirmed two-phase preview.
+
+        For Lidarr, an optional album_id deletes a single album of the artist
+        identified by item_id instead of the whole artist.
+        """
         return await _guarded(
-            client.delete_media(service, item_id, delete_files, confirmation)
+            client.delete_media(service, item_id, delete_files, confirmation, album_id)
         )
 
 

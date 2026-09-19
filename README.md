@@ -13,19 +13,23 @@ Playback Reporting plugin (v19).
 
 Read tools, always available:
 
-- `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination; includes the added date, genres, size on disk, and file counts for cleanup audits)
+- `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination; includes the added date, genres, size on disk, and file counts for cleanup audits; Sonarr items also list per-season monitored flags)
 - `arr_quality_profiles`
 - `arr_root_folders`
 - `arr_search_candidates` (upstream catalog lookup; bounded, projected results)
+- `arr_season_inventory` (Sonarr; per-season monitored flags with episode and episode-file counts aggregated from the episode endpoint)
+- `arr_album_inventory` (Lidarr; per-album monitored flag, release date, track file count, size on disk, and file presence for one artist)
 - `tautulli_play_history` (movie, episode, or track; inclusive maximum 31-day range and optional numeric user filter)
 - `jellyfin_play_history` (movie, episode, or track; inclusive maximum 31-day range, exact 32-hex-character user id, and local pagination)
 - `jellyfin_users` (id/name pairs from `GET /Users`, so `jellyfin_play_history` user ids are discoverable without dashboard access)
 
 Write tools, registered only when enabled:
 
-- `arr_request_media` and `arr_unmonitor_media` behind
-  `MEDIA_BROKER_ENABLE_REQUESTS=true`
-- `arr_delete_media` behind `MEDIA_BROKER_ENABLE_DELETES=true`
+- `arr_request_media`, `arr_unmonitor_media`, `arr_monitor_media`,
+  `arr_set_season_monitoring`, `arr_set_album_monitored`, and `arr_search_item`
+  behind `MEDIA_BROKER_ENABLE_REQUESTS=true`
+- `arr_delete_media` (whole items and, for Lidarr, single albums) behind
+  `MEDIA_BROKER_ENABLE_DELETES=true`
 
 There are no generic upstream requests, approval endpoints, Seerr, or Jellyfin
 core endpoints. Arr APIs return arrays, so inventory pagination is performed
@@ -46,18 +50,36 @@ add body. Lidarr adds use the lowest configured metadata profile id. By default
 the add starts searching for downloads immediately (`search_on_add=true`);
 pass `false` for monitor-only additions.
 
+Sonarr adds accept an optional `seasons` list (for example `[1]` for a
+season-one trial). The broker marks only those seasons monitored in the add
+body and omits Sonarr's `monitor` option, so episode monitoring derives from
+the submitted season flags and the add-search can never touch unselected
+seasons. Season monitoring can be changed later with
+`arr_set_season_monitoring` and verified through `arr_season_inventory`.
+
+Lidarr adds monitor the whole discography, so a selective album add is a
+sequence: add with `search_on_add=false`, list albums with
+`arr_album_inventory`, unmonitor the unwanted albums (and delete their files
+with `arr_delete_media` if the delete gate is enabled), then run
+`arr_search_item` to search the artist's monitored missing albums.
+
 ## Library cleanup
 
 `arr_unmonitor_media` stops monitoring one item while keeping its metadata and
-files; it is reversible and needs no confirmation.
+files; it is reversible with `arr_monitor_media` and needs no confirmation.
+`arr_set_season_monitoring` (Sonarr) and `arr_set_album_monitored` (Lidarr)
+flip monitoring below the item level and are likewise reversible.
 
 `arr_delete_media` removes one item and is destructive. It always runs in two
 phases: the first call returns a preview of the projected item plus a
 five-minute signed confirmation token (`itsdangerous`) bound to the exact
-action (service, item id, and file mode), and only a second call carrying
-that token executes the delete. `delete_files=false` (the default) removes the item but keeps files on
-disk; `delete_files=true` removes files too. Import-list exclusions are never
-added, so exclusion lists are managed by the operator, not the broker.
+action (service, item id, album id, and file mode), and only a second call
+carrying that token executes the delete. For Lidarr, an optional `album_id`
+deletes a single album instead of the artist; the preview then shows both the
+album and the artist so the caller can verify the target. `delete_files=false`
+(the default) removes the item but keeps files on disk; `delete_files=true`
+removes files too. Import-list exclusions are never added, so exclusion lists
+are managed by the operator, not the broker.
 
 ## Local run
 
@@ -104,8 +126,9 @@ projected string. `size_on_disk_bytes` comes from Radarr's `movieFile.size`
 and from `statistics.sizeOnDisk` on Sonarr and Lidarr. File presence is
 Radarr's `hasFile` for movies; for series and artists the broker projects
 `episode_file_count` or `track_file_count` from `statistics` and derives
-`has_file` from a nonzero count. A missing or wrongly typed statistics block
-projects to nulls, never to guesses.
+`has_file` from a nonzero count. Sonarr items also project `seasons`, a
+per-season list of monitored flags capped at 64 entries. A missing or wrongly
+typed statistics block projects to nulls, never to guesses.
 
 History projections contain only scalar, validated fields. The explicitly
 approved stable identifiers `tautulli_user_id`, `tautulli_rating_key`, and
@@ -123,9 +146,10 @@ is reported as unknown, not false.
 
 Tool argument bounds (page 1-100000, page size 1-100, search text up to 200
 characters, strict `YYYY-MM-DD` dates, non-negative Tautulli `user_id`, Jellyfin
-timezone offsets from -14 to 14 hours, external ids up to 64 characters, item
-and profile ids within int32, candidate lists of at most 100, confirmation
-tokens up to 128 characters) are declared in
+timezone offsets from -14 to 14 hours, external ids up to 64 characters, item,
+profile, and album ids within int32, season selections of 1-100 season numbers
+between 0 and 1000, candidate lists of at most 100, confirmation tokens up to
+128 characters) are declared in
 each tool's input schema, so clients see them before calling. Rejected
 arguments, upstream failures, and unexpected errors are all reported through the
 MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys

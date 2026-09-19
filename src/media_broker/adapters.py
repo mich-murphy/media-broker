@@ -21,12 +21,15 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from .config import Settings, Upstream
 
 ArrService = Literal["sonarr", "radarr", "lidarr"]
+SonarrService = Literal["sonarr"]
+LidarrService = Literal["lidarr"]
 TautulliMediaType = Literal["movie", "episode", "track"]
 JellyfinMediaType = Literal["movie", "episode", "track"]
 
 _MAX_ITEMS = 10_000
 _MAX_PROJECTED_STRING = 1024
 _MAX_LIST_ENTRIES = 16
+_MAX_SEASON_ENTRIES = 64
 _MAX_REQUEST_BYTES = 262_144
 _CONFIRM_TTL_SECONDS = 300
 _JELLYFIN_FILTERS = {"movie": "Movie", "episode": "Episode", "track": "Audio"}
@@ -86,6 +89,17 @@ _JELLYFIN_USER: _Fields = {
     "jellyfin_user_id": ("Id", str),
     "name": ("Name", str),
 }
+_COMMAND: _Fields = {
+    "command_id": ("id", int),
+    "name": ("name", str),
+    "status": ("status", str),
+}
+# (command name, id field, whether the id field takes a list) per service.
+_SEARCH_COMMAND: dict[ArrService, tuple[str, str, bool]] = {
+    "sonarr": ("SeriesSearch", "seriesId", False),
+    "radarr": ("MoviesSearch", "movieIds", True),
+    "lidarr": ("ArtistSearch", "artistId", False),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,8 +113,9 @@ class ArrServiceSpec:
     title_field: str
     id_description: str
     id_valid: Callable[[str], bool]
-    build_add: Callable[  # (candidate, quality, metadata, root, search) -> body
-        [Mapping[str, Any], int, int | None, str, bool], dict[str, Any]
+    build_add: Callable[  # (candidate, quality, metadata, root, search, seasons)
+        [Mapping[str, Any], int, int | None, str, bool, list[int] | None],
+        dict[str, Any],
     ]
     inventory_extras: Callable[[Mapping[str, Any]], dict[str, Any]]
     needs_metadata: bool = False
@@ -179,17 +194,24 @@ def _numeric_catalog_id(value: str) -> bool:
     )
 
 
-def _sonarr_seasons(candidate: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _sonarr_seasons(
+    candidate: Mapping[str, Any], selection: list[int] | None
+) -> list[dict[str, Any]]:
     rows = candidate.get("seasons")
-    seasons = [
-        {"seasonNumber": number, "monitored": True}
+    numbers = [
+        number
         for row in (rows if isinstance(rows, list) else [])
         if isinstance(row, dict)
         and isinstance(number := _scalar(row.get("seasonNumber"), int), int)
     ]
-    if not seasons:
+    if not numbers:
         raise ParameterError("the lookup candidate has no season metadata")
-    return seasons
+    if selection is not None and not set(selection) <= set(numbers):
+        raise ParameterError("one or more seasons do not exist on the candidate")
+    return [
+        {"seasonNumber": number, "monitored": selection is None or number in selection}
+        for number in numbers
+    ]
 
 
 def _sonarr_add_body(
@@ -198,7 +220,17 @@ def _sonarr_add_body(
     _metadata: int | None,
     root: str,
     search: bool,
+    seasons: list[int] | None,
 ) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "searchForMissingEpisodes": search,
+        "searchForCutoffUnmetEpisodes": False,
+    }
+    if seasons is None:
+        options["monitor"] = "all"
+    # With a season selection the monitor option is omitted entirely: Sonarr's
+    # legacy path then derives episode monitoring from the submitted season
+    # flags, so an add-search only ever touches the selected seasons.
     return {
         "title": _scalar(candidate.get("title"), str),
         "titleSlug": _scalar(candidate.get("titleSlug"), str),
@@ -208,12 +240,8 @@ def _sonarr_add_body(
         "seriesType": _scalar(candidate.get("seriesType"), str) or "standard",
         "monitored": True,
         "seasonFolder": True,
-        "seasons": _sonarr_seasons(candidate),
-        "addOptions": {
-            "monitor": "all",
-            "searchForMissingEpisodes": search,
-            "searchForCutoffUnmetEpisodes": False,
-        },
+        "seasons": _sonarr_seasons(candidate, seasons),
+        "addOptions": options,
     }
 
 
@@ -223,6 +251,7 @@ def _radarr_add_body(
     _metadata: int | None,
     root: str,
     search: bool,
+    _seasons: list[int] | None,
 ) -> dict[str, Any]:
     return {
         "title": _scalar(candidate.get("title"), str),
@@ -243,6 +272,7 @@ def _lidarr_add_body(
     metadata_id: int | None,
     root: str,
     search: bool,
+    _seasons: list[int] | None,
 ) -> dict[str, Any]:
     if metadata_id is None:
         raise UpstreamError("upstream returned an unexpected metadata profile response")
@@ -278,6 +308,23 @@ def _radarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _season_summaries(value: Any) -> list[dict[str, Any]] | None:
+    """Project a capped season list to season_number and monitored flags."""
+    if not isinstance(value, list):
+        return None
+    seasons = []
+    for row in value[:_MAX_SEASON_ENTRIES]:
+        if not isinstance(row, Mapping):
+            continue
+        number = _scalar(row.get("seasonNumber"), int)
+        if number is None:
+            continue
+        seasons.append(
+            {"season_number": number, "monitored": _scalar(row.get("monitored"), bool)}
+        )
+    return seasons
+
+
 def _sonarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
     stats = _statistics(row)
     count = _scalar(stats.get("episodeFileCount"), int)
@@ -285,6 +332,7 @@ def _sonarr_inventory_extras(row: Mapping[str, Any]) -> dict[str, Any]:
         "size_on_disk_bytes": _scalar(stats.get("sizeOnDisk"), int),
         "episode_file_count": count,
         "has_file": None if count is None else count > 0,
+        "seasons": _season_summaries(row.get("seasons")),
     }
 
 
@@ -337,6 +385,28 @@ ARR_SERVICES: dict[ArrService, ArrServiceSpec] = {
         True,
     ),
 }
+
+
+def _album_summary(row: Mapping[str, Any], fallback_id: int) -> dict[str, Any]:
+    return {
+        "album_id": _scalar(row.get("id"), int) or fallback_id,
+        "title": _bounded(_scalar(row.get("title"), str)),
+        "monitored": _scalar(row.get("monitored"), bool),
+    }
+
+
+def _album_inventory_item(row: Mapping[str, Any]) -> dict[str, Any]:
+    stats = _statistics(row)
+    count = _scalar(stats.get("trackFileCount"), int)
+    return {
+        "album_id": _scalar(row.get("id"), int),
+        "title": _bounded(_scalar(row.get("title"), str)),
+        "monitored": _scalar(row.get("monitored"), bool),
+        "release_date": _bounded(_scalar(row.get("releaseDate"), str)),
+        "track_file_count": count,
+        "size_on_disk_bytes": _scalar(stats.get("sizeOnDisk"), int),
+        "has_file": None if count is None else count > 0,
+    }
 
 
 def _lookup_item(row: Mapping[str, Any], spec: ArrServiceSpec) -> dict[str, Any]:
@@ -525,9 +595,12 @@ class MediaClient:
         quality_profile_id: int,
         root_folder_path: str,
         search_on_add: bool,
+        seasons: list[int] | None = None,
     ) -> dict[str, Any]:
         """Add one exact catalog item; the broker builds the add body itself."""
         spec = ARR_SERVICES[service]
+        if seasons is not None and service != "sonarr":
+            raise ParameterError("seasons is only supported for sonarr")
         identifier = external_id.strip()
         if not spec.id_valid(identifier):
             raise ParameterError(
@@ -563,7 +636,7 @@ class MediaClient:
             await self._metadata_profile_id(service) if spec.needs_metadata else None
         )
         body = spec.build_add(
-            candidate, quality_profile_id, metadata, root, search_on_add
+            candidate, quality_profile_id, metadata, root, search_on_add, seasons
         )
         added = await self._json(
             self.settings.upstreams[service],
@@ -576,6 +649,7 @@ class MediaClient:
             "service": service,
             "item": _lookup_item(added, spec),
             "search_on_add": search_on_add,
+            "seasons": seasons,
         }
 
     async def _add_destination(
@@ -614,10 +688,10 @@ class MediaClient:
         )
         return dict(payload)
 
-    async def unmonitor_media(
-        self, service: ArrService, item_id: int
+    async def set_monitoring(
+        self, service: ArrService, item_id: int, monitored: bool
     ) -> dict[str, Any]:
-        """Flip one item's monitored flag off; everything else is left untouched."""
+        """Flip one item's monitored flag; everything else is left untouched."""
         spec = ARR_SERVICES[service]
         upstream = self.settings.upstreams[service]
         item = await self._arr_item(service, item_id)
@@ -625,10 +699,122 @@ class MediaClient:
             upstream,
             upstream.api(spec.resource, item_id),
             method="PUT",
-            request_body=item | {"monitored": False},
+            request_body=item | {"monitored": monitored},
             expect=dict,
         )
         return {"service": service, "item": _item_summary(updated, spec, item_id)}
+
+    async def set_season_monitoring(
+        self, service: SonarrService, item_id: int, seasons: list[int], monitored: bool
+    ) -> dict[str, Any]:
+        """Flip the monitored flag of a set of seasons on one Sonarr series."""
+        upstream = self.settings.upstreams[service]
+        record = await self._arr_item(service, item_id)
+        rows = record.get("seasons")
+        if not isinstance(rows, list):
+            raise UpstreamError("upstream returned an unexpected series response")
+        wanted = set(seasons)
+        found: set[int] = set()
+        updated_rows = []
+        for row in rows:
+            number = (
+                _scalar(row.get("seasonNumber"), int) if isinstance(row, dict) else None
+            )
+            if number in wanted and isinstance(row, dict):
+                found.add(number)
+                updated_rows.append(row | {"monitored": monitored})
+            else:
+                updated_rows.append(row)
+        if found != wanted:
+            raise ParameterError("one or more seasons do not exist on the series")
+        updated = await self._json(
+            upstream,
+            upstream.api("series", item_id),
+            method="PUT",
+            request_body=record | {"seasons": updated_rows},
+            expect=dict,
+        )
+        return {
+            "service": service,
+            "item": _item_summary(updated, ARR_SERVICES[service], item_id),
+            "seasons": _season_summaries(updated.get("seasons")),
+        }
+
+    async def season_inventory(
+        self, service: SonarrService, item_id: int
+    ) -> dict[str, Any]:
+        """Aggregate per-season monitoring and episode file counts for one series."""
+        record = await self._arr_item(service, item_id)
+        episodes = await self._arr_items(
+            service, "episode", params={"seriesId": item_id}
+        )
+        counts: dict[int, list[int]] = {}
+        for episode in episodes:
+            number = _scalar(episode.get("seasonNumber"), int)
+            if number is None:
+                continue
+            totals = counts.setdefault(number, [0, 0])
+            totals[0] += 1
+            totals[1] += 1 if episode.get("hasFile") is True else 0
+        seasons = [
+            {
+                **summary,
+                "episode_count": counts.get(summary["season_number"], [0, 0])[0],
+                "episode_file_count": counts.get(summary["season_number"], [0, 0])[1],
+            }
+            for summary in _season_summaries(record.get("seasons")) or []
+        ]
+        return {
+            "service": service,
+            "item": _item_summary(record, ARR_SERVICES[service], item_id),
+            "seasons": seasons,
+        }
+
+    async def album_inventory(
+        self, service: LidarrService, artist_id: int
+    ) -> dict[str, Any]:
+        """Project every album of one Lidarr artist with file and size details."""
+        albums = await self._arr_items(service, "album", params={"artistId": artist_id})
+        return {
+            "service": service,
+            "artist_id": artist_id,
+            "items": [_album_inventory_item(row) for row in albums],
+        }
+
+    async def _lidarr_album(self, album_id: int) -> dict[str, Any]:
+        upstream = self.settings.upstreams["lidarr"]
+        payload = await self._json(
+            upstream, upstream.api("album", album_id), expect=dict
+        )
+        return dict(payload)
+
+    async def set_album_monitored(
+        self, service: LidarrService, album_id: int, monitored: bool
+    ) -> dict[str, Any]:
+        """Flip one Lidarr album's monitored flag; reversible in both directions."""
+        upstream = self.settings.upstreams[service]
+        album = await self._lidarr_album(album_id)
+        updated = await self._json(
+            upstream,
+            upstream.api("album", album_id),
+            method="PUT",
+            request_body=album | {"monitored": monitored},
+            expect=dict,
+        )
+        return {"service": service, "album": _album_summary(updated, album_id)}
+
+    async def search_item(self, service: ArrService, item_id: int) -> dict[str, Any]:
+        """Queue an upstream search for one item's monitored missing content."""
+        name, key, plural = _SEARCH_COMMAND[service]
+        upstream = self.settings.upstreams[service]
+        payload = await self._json(
+            upstream,
+            upstream.api("command"),
+            method="POST",
+            request_body={"name": name, key: [item_id] if plural else item_id},
+            expect=dict,
+        )
+        return {"service": service, "command": _project(payload, _COMMAND)}
 
     async def delete_media(
         self,
@@ -636,11 +822,18 @@ class MediaClient:
         item_id: int,
         delete_files: bool,
         confirmation: str | None = None,
+        album_id: int | None = None,
     ) -> dict[str, Any]:
         """Two-phase delete: preview with a bound confirmation, then execute."""
+        if album_id is not None:
+            if service != "lidarr":
+                raise ParameterError("album_id is only supported for lidarr")
+            return await self._delete_album(
+                item_id, album_id, delete_files, confirmation
+            )
         spec = ARR_SERVICES[service]
         item = await self._arr_item(service, item_id)
-        action = [_DELETE_ACTION, service, item_id, delete_files]
+        action = [_DELETE_ACTION, service, item_id, None, delete_files]
         summary = {
             "service": service,
             "item": _item_summary(item, spec, item_id),
@@ -656,6 +849,46 @@ class MediaClient:
                     "deleteFiles": "true" if delete_files else "false",
                     "addImportListExclusion": "false",
                 },
+                method="DELETE",
+                allow_empty=True,
+            )
+            return {"deleted": True, **summary}
+        return {
+            "confirmation_required": True,
+            **summary,
+            "confirmation": self._confirmations.dumps(action),
+            "confirmation_expires_at": int(time.time()) + _CONFIRM_TTL_SECONDS,
+        }
+
+    async def _delete_album(
+        self,
+        artist_id: int,
+        album_id: int,
+        delete_files: bool,
+        confirmation: str | None,
+    ) -> dict[str, Any]:
+        """Two-phase delete of one Lidarr album, leaving the artist in place."""
+        upstream = self.settings.upstreams["lidarr"]
+        album = await self._lidarr_album(album_id)
+        if _scalar(album.get("artistId"), int) != artist_id:
+            raise ParameterError("album_id does not belong to item_id")
+        artist = await self._arr_item("lidarr", artist_id)
+        action = [_DELETE_ACTION, "lidarr", artist_id, album_id, delete_files]
+        summary = {
+            "service": "lidarr",
+            "item": _album_summary(album, album_id),
+            "artist": {
+                "id": artist_id,
+                "title": _bounded(_scalar(artist.get("artistName"), str)),
+            },
+            "delete_files": delete_files,
+        }
+        if confirmation is not None:
+            self._confirmation_must_match(action, confirmation)
+            await self._json(
+                upstream,
+                upstream.api("album", album_id),
+                {"deleteFiles": "true" if delete_files else "false"},
                 method="DELETE",
                 allow_empty=True,
             )

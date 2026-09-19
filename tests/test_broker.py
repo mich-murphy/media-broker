@@ -47,11 +47,21 @@ TOOL_NAMES = {
     "arr_quality_profiles",
     "arr_root_folders",
     "arr_search_candidates",
+    "arr_season_inventory",
+    "arr_album_inventory",
     "tautulli_play_history",
     "jellyfin_play_history",
     "jellyfin_users",
 }
-WRITE_TOOL_NAMES = {"arr_request_media", "arr_unmonitor_media", "arr_delete_media"}
+WRITE_TOOL_NAMES = {
+    "arr_request_media",
+    "arr_unmonitor_media",
+    "arr_monitor_media",
+    "arr_set_season_monitoring",
+    "arr_set_album_monitored",
+    "arr_search_item",
+    "arr_delete_media",
+}
 
 
 def reply(payload: Any, status: int = 200, **kwargs: Any) -> Handler:
@@ -256,7 +266,7 @@ def test_bearer_token_file_must_be_private_and_well_formed(
             "/api/v3/series",
             {"title": "Example"},
             "Example",
-            {"episode_file_count": None},
+            {"episode_file_count": None, "seasons": None},
         ),
         (
             "lidarr",
@@ -1009,29 +1019,36 @@ MCP_HEADERS = {
 
 def route_upstreams(request: httpx.Request) -> httpx.Response:
     """A fake upstream that answers Arr and history endpoints with one item each."""
-    if request.url.path == "/api/v2":
+    path = request.url.path
+    if path == "/api/v2":
         return history_reply([{"title": "Movie", "user_id": 3}])(request)
-    if request.url.path == "/Users":
+    if path == "/Users":
         return httpx.Response(
             200, json=[{"Id": JELLYFIN_USER, "Name": "Alice", "Policy": {}}]
         )
-    if request.url.path.startswith("/user_usage_stats/"):
-        return httpx.Response(
-            200,
-            json=[
-                {
-                    "Id": "item-id",
-                    "RowId": 8,
-                    "Name": "Movie",
-                    "Type": "Movie",
-                    "Time": "12:34:56",
-                    "Duration": 120,
-                }
-            ],
-        )
-    return httpx.Response(
-        200, json=[{"id": 1, "title": "Item", "name": "HD", "path": "/tv"}]
-    )
+    payload: Any = [{"id": 1, "title": "Item", "name": "HD", "path": "/tv"}]
+    if path.startswith("/user_usage_stats/"):
+        payload = [
+            {
+                "Id": "item-id",
+                "RowId": 8,
+                "Name": "Movie",
+                "Type": "Movie",
+                "Time": "12:34:56",
+                "Duration": 120,
+            }
+        ]
+    elif path.endswith("/episode"):
+        payload = [{"seasonNumber": 1, "hasFile": True}]
+    elif path.endswith("/album"):
+        payload = [{"id": 11, "title": "Album", "statistics": {}}]
+    elif path.rsplit("/", 1)[-1].isdigit():
+        payload = {
+            "id": 1,
+            "title": "Item",
+            "seasons": [{"seasonNumber": 1, "monitored": True}],
+        }
+    return httpx.Response(200, json=payload)
 
 
 class RecordingTransport(httpx.MockTransport):
@@ -1193,6 +1210,23 @@ def test_each_tool_answers_over_streamable_http(
     assert json.loads(result["content"][0]["text"]) == content
 
 
+def test_detail_read_tools_answer_over_streamable_http(mcp: TestClient) -> None:
+    seasons = call_tool(mcp, "arr_season_inventory", service="sonarr", item_id=3)
+    assert not seasons.get("isError")
+    assert seasons["structuredContent"]["seasons"] == [
+        {
+            "season_number": 1,
+            "monitored": True,
+            "episode_count": 1,
+            "episode_file_count": 1,
+        }
+    ]
+    albums = call_tool(mcp, "arr_album_inventory", service="lidarr", artist_id=42)
+    assert not albums.get("isError")
+    assert albums["structuredContent"]["artist_id"] == 42
+    assert albums["structuredContent"]["items"][0]["album_id"] == 11
+
+
 @pytest.mark.parametrize(
     ("name", "arguments", "field"),
     [
@@ -1258,6 +1292,8 @@ def test_each_tool_answers_over_streamable_http(
             },
             "timezone_offset",
         ),
+        ("arr_season_inventory", {"service": "radarr", "item_id": 3}, "service"),
+        ("arr_album_inventory", {"service": "lidarr", "artist_id": 0}, "artist_id"),
     ],
 )
 def test_out_of_bounds_arguments_are_rejected_before_any_upstream_call(
@@ -1393,14 +1429,23 @@ def write_backend(
     profiles: list[dict[str, Any]] | None = None,
     folders: list[dict[str, Any]] | None = None,
     metadata: list[dict[str, Any]] | None = None,
+    episodes: list[dict[str, Any]] | None = None,
+    albums: list[dict[str, Any]] | None = None,
 ) -> Handler:
     """A routed write-capable fake upstream sharing every write fixture."""
     record = {"id": 42, "title": "Item"} if item is None else item
+    album_record = (
+        {"id": 11, "title": "Example Album", "artistId": 42, "monitored": True}
+        if albums is None
+        else albums[0]
+    )
     data = {
         "/lookup": candidates,
         "/qualityprofile": [{"id": 7}] if profiles is None else profiles,
         "/rootfolder": [{"path": "/media"}] if folders is None else folders,
         "/metadataprofile": [{"id": 1}] if metadata is None else metadata,
+        "/episode": [] if episodes is None else episodes,
+        "/album": [album_record] if albums is None else albums,
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1416,11 +1461,20 @@ def write_backend(
             return httpx.Response(200, json=payload)
         if request.method == "DELETE":
             return httpx.Response(200)
-        if request.method == "PUT":
-            return httpx.Response(200, json=record | {"monitored": False})
-        if request.method == "POST":
-            return httpx.Response(200, json=record | {"id": 42})
-        return httpx.Response(200, json=record)
+        body: Any = record
+        if request.method == "GET" and "/album/" in request.url.path:
+            body = album_record
+        elif request.method == "PUT":
+            body = json.loads(request.content)
+        elif request.method == "POST":
+            body = record | {"id": 42}
+            if request.url.path.endswith("/command"):
+                body = {
+                    "id": 9,
+                    "name": json.loads(request.content)["name"],
+                    "status": "queued",
+                }
+        return httpx.Response(200, json=body)
 
     return handler
 
@@ -1503,7 +1557,7 @@ async def test_writes_send_a_json_content_type_but_reads_do_not(
     seen = transport.requests
     client = make_client(transport)
     await client.request_media("sonarr", "81189", 7, "/media", True)
-    await client.unmonitor_media("sonarr", 3)
+    await client.set_monitoring("sonarr", 3, False)
     writes = [request for request in seen if request.method in {"POST", "PUT"}]
     assert len(writes) == 2
     for request in writes:
@@ -1609,13 +1663,338 @@ async def test_unmonitor_media_merges_and_returns_one_projection(
     }
     transport = RecordingTransport(write_backend([], item=item))
     seen = transport.requests
-    result = await make_client(transport).unmonitor_media("sonarr", 3)
+    result = await make_client(transport).set_monitoring("sonarr", 3, False)
     put = next(request for request in seen if request.method == "PUT")
     assert put.url.path == "/api/v3/series/3"
     assert json.loads(put.content) == item | {"monitored": False}
     assert result == {
         "service": "sonarr",
         "item": {"id": 3, "title": "Show", "monitored": False},
+    }
+
+
+async def test_monitor_media_sets_the_flag_back_on(make_client: ClientFactory) -> None:
+    item = {"id": 3, "title": "Show", "monitored": False, "seasons": []}
+    transport = RecordingTransport(write_backend([], item=item))
+    seen = transport.requests
+    result = await make_client(transport).set_monitoring("sonarr", 3, True)
+    put = next(request for request in seen if request.method == "PUT")
+    assert put.url.path == "/api/v3/series/3"
+    assert json.loads(put.content) == item | {"monitored": True}
+    assert result["item"]["monitored"] is True
+
+
+@pytest.mark.parametrize("search", [True, False])
+async def test_request_media_monitors_and_searches_only_selected_seasons(
+    make_client: ClientFactory, search: bool
+) -> None:
+    transport = RecordingTransport(write_backend([SONARR_CANDIDATE]))
+    seen = transport.requests
+    result = await make_client(transport).request_media(
+        "sonarr", "81189", 7, "/media", search, [1]
+    )
+    post = next(request for request in seen if request.method == "POST")
+    body = json.loads(post.content)
+    assert body["seasons"] == [
+        {"seasonNumber": 1, "monitored": True},
+        {"seasonNumber": 2, "monitored": False},
+    ]
+    # No monitor option: Sonarr derives episode monitoring from the season
+    # flags, so an add-search can never touch the unselected seasons.
+    assert "monitor" not in body["addOptions"]
+    assert body["addOptions"]["searchForMissingEpisodes"] is search
+    assert result["seasons"] == [1]
+
+
+async def test_request_media_rejects_seasons_for_other_services(
+    make_client: ClientFactory,
+) -> None:
+    def forbidden(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must not be called")
+
+    with pytest.raises(ParameterError, match="only supported for sonarr"):
+        await make_client(forbidden).request_media(
+            "radarr", "603", 7, "/media", True, [1]
+        )
+
+
+async def test_request_media_rejects_unknown_season_numbers(
+    make_client: ClientFactory,
+) -> None:
+    transport = RecordingTransport(write_backend([SONARR_CANDIDATE]))
+    seen = transport.requests
+    with pytest.raises(ParameterError, match="do not exist"):
+        await make_client(transport).request_media(
+            "sonarr", "81189", 7, "/media", True, [3]
+        )
+    assert all(request.method == "GET" for request in seen)
+
+
+async def test_set_season_monitoring_flips_only_the_requested_seasons(
+    make_client: ClientFactory,
+) -> None:
+    item = {
+        "id": 3,
+        "title": "Show",
+        "monitored": True,
+        "seasons": [
+            {"seasonNumber": 0, "monitored": False},
+            {"seasonNumber": 1, "monitored": True},
+            {"seasonNumber": 2, "monitored": True},
+        ],
+    }
+    transport = RecordingTransport(write_backend([], item=item))
+    seen = transport.requests
+    result = await make_client(transport).set_season_monitoring("sonarr", 3, [2], False)
+    put = next(request for request in seen if request.method == "PUT")
+    assert put.url.path == "/api/v3/series/3"
+    assert json.loads(put.content)["seasons"] == [
+        {"seasonNumber": 0, "monitored": False},
+        {"seasonNumber": 1, "monitored": True},
+        {"seasonNumber": 2, "monitored": False},
+    ]
+    assert result == {
+        "service": "sonarr",
+        "item": {"id": 3, "title": "Show", "monitored": True},
+        "seasons": [
+            {"season_number": 0, "monitored": False},
+            {"season_number": 1, "monitored": True},
+            {"season_number": 2, "monitored": False},
+        ],
+    }
+
+
+async def test_set_season_monitoring_rejects_unknown_seasons(
+    make_client: ClientFactory,
+) -> None:
+    item = {
+        "id": 3,
+        "title": "Show",
+        "seasons": [{"seasonNumber": 1, "monitored": True}],
+    }
+    transport = RecordingTransport(write_backend([], item=item))
+    seen = transport.requests
+    with pytest.raises(ParameterError, match="do not exist"):
+        await make_client(transport).set_season_monitoring("sonarr", 3, [1, 9], False)
+    assert all(request.method == "GET" for request in seen)
+
+
+async def test_season_inventory_aggregates_episode_counts_per_season(
+    make_client: ClientFactory,
+) -> None:
+    item = {
+        "id": 3,
+        "title": "Show",
+        "monitored": True,
+        "seasons": [
+            {"seasonNumber": 1, "monitored": True},
+            {"seasonNumber": 2, "monitored": False},
+        ],
+    }
+    episodes: list[dict[str, Any]] = [
+        {"seasonNumber": 1, "hasFile": True},
+        {"seasonNumber": 1, "hasFile": True},
+        {"seasonNumber": 1, "hasFile": False},
+        {"seasonNumber": 2, "hasFile": False},
+        {"seasonNumber": "junk", "hasFile": True},
+    ]
+    transport = RecordingTransport(write_backend([], item=item, episodes=episodes))
+    seen = transport.requests
+    result = await make_client(transport).season_inventory("sonarr", 3)
+    episode_request = next(r for r in seen if r.url.path.endswith("/episode"))
+    assert episode_request.url.params["seriesId"] == "3"
+    assert result == {
+        "service": "sonarr",
+        "item": {"id": 3, "title": "Show", "monitored": True},
+        "seasons": [
+            {
+                "season_number": 1,
+                "monitored": True,
+                "episode_count": 3,
+                "episode_file_count": 2,
+            },
+            {
+                "season_number": 2,
+                "monitored": False,
+                "episode_count": 1,
+                "episode_file_count": 0,
+            },
+        ],
+    }
+
+
+async def test_inventory_projects_season_monitoring_for_sonarr(
+    make_client: ClientFactory,
+) -> None:
+    seasons = [
+        {"seasonNumber": index, "monitored": index % 2 == 0} for index in range(70)
+    ]
+    result = await make_client(
+        reply([{"id": 1, "title": "Show", "seasons": seasons}])
+    ).inventory("sonarr", 1, 10)
+    projected = result["items"][0]["seasons"]
+    assert len(projected) == 64
+    assert projected[:2] == [
+        {"season_number": 0, "monitored": True},
+        {"season_number": 1, "monitored": False},
+    ]
+    not_a_list = await make_client(reply([{"id": 1, "seasons": "junk"}])).inventory(
+        "sonarr", 1, 10
+    )
+    assert not_a_list["items"][0]["seasons"] is None
+
+
+async def test_album_inventory_projects_file_and_size_details(
+    make_client: ClientFactory,
+) -> None:
+    albums = [
+        {
+            "id": 11,
+            "title": "Example Album",
+            "releaseDate": "1994-01-01T00:00:00Z",
+            "monitored": True,
+            "statistics": {
+                "trackFileCount": 5,
+                "sizeOnDisk": 40_000_000,
+                "percentOfTracks": "must not pass",
+            },
+            "artist": {"artistName": "must not pass"},
+        },
+        {
+            "id": 12,
+            "title": "Other",
+            "monitored": False,
+            "statistics": {"trackFileCount": 0, "sizeOnDisk": 0},
+        },
+    ]
+    transport = RecordingTransport(write_backend([], albums=albums))
+    seen = transport.requests
+    result = await make_client(transport).album_inventory("lidarr", 42)
+    assert seen[0].url.path == "/api/v1/album"
+    assert seen[0].url.params["artistId"] == "42"
+    assert result == {
+        "service": "lidarr",
+        "artist_id": 42,
+        "items": [
+            {
+                "album_id": 11,
+                "title": "Example Album",
+                "monitored": True,
+                "release_date": "1994-01-01T00:00:00Z",
+                "track_file_count": 5,
+                "size_on_disk_bytes": 40_000_000,
+                "has_file": True,
+            },
+            {
+                "album_id": 12,
+                "title": "Other",
+                "monitored": False,
+                "release_date": None,
+                "track_file_count": 0,
+                "size_on_disk_bytes": 0,
+                "has_file": False,
+            },
+        ],
+    }
+    assert "percentOfTracks" not in result["items"][0]
+
+
+@pytest.mark.parametrize("monitored", [True, False])
+async def test_set_album_monitored_flips_one_album(
+    make_client: ClientFactory, monitored: bool
+) -> None:
+    album = {
+        "id": 11,
+        "title": "Example Album",
+        "artistId": 42,
+        "monitored": not monitored,
+        "secret": "upstream-only",
+    }
+    transport = RecordingTransport(write_backend([], albums=[album]))
+    seen = transport.requests
+    result = await make_client(transport).set_album_monitored("lidarr", 11, monitored)
+    put = next(request for request in seen if request.method == "PUT")
+    assert put.url.path == "/api/v1/album/11"
+    assert json.loads(put.content) == album | {"monitored": monitored}
+    assert result == {
+        "service": "lidarr",
+        "album": {"album_id": 11, "title": "Example Album", "monitored": monitored},
+    }
+
+
+async def test_delete_media_with_album_id_is_a_two_phase_album_delete(
+    make_client: ClientFactory,
+) -> None:
+    artist = {"id": 42, "artistName": "Example Band", "monitored": True}
+    album = {"id": 11, "title": "Example Album", "artistId": 42, "monitored": True}
+    transport = RecordingTransport(write_backend([], item=artist, albums=[album]))
+    seen = transport.requests
+    client = make_client(transport)
+    preview = await client.delete_media("lidarr", 42, True, album_id=11)
+    assert preview["confirmation_required"] is True
+    assert preview["item"] == {
+        "album_id": 11,
+        "title": "Example Album",
+        "monitored": True,
+    }
+    assert preview["artist"] == {"id": 42, "title": "Example Band"}
+    assert [request.method for request in seen] == ["GET", "GET"]
+    completed = await client.delete_media(
+        "lidarr", 42, True, preview["confirmation"], album_id=11
+    )
+    assert completed["deleted"] is True
+    delete = seen[-1]
+    assert [request.method for request in seen] == [
+        "GET",
+        "GET",
+        "GET",
+        "GET",
+        "DELETE",
+    ]
+    assert delete.url.path == "/api/v1/album/11"
+    assert delete.url.params["deleteFiles"] == "true"
+    # An album confirmation is bound to the exact album delete action.
+    with pytest.raises(ParameterError, match="confirmation"):
+        await client.delete_media("lidarr", 42, True, preview["confirmation"])
+    with pytest.raises(ParameterError, match="confirmation"):
+        await client.delete_media(
+            "lidarr", 42, False, preview["confirmation"], album_id=12
+        )
+
+
+async def test_delete_album_requires_lidarr_and_a_matching_artist(
+    make_client: ClientFactory,
+) -> None:
+    with pytest.raises(ParameterError, match="only supported for lidarr"):
+        await make_client(reply([])).delete_media("sonarr", 3, False, album_id=11)
+    album = {"id": 11, "title": "Example Album", "artistId": 9, "monitored": True}
+    with pytest.raises(ParameterError, match="does not belong"):
+        await make_client(write_backend([], albums=[album])).delete_media(
+            "lidarr", 42, False, album_id=11
+        )
+
+
+@pytest.mark.parametrize(
+    ("service", "body"),
+    [
+        ("sonarr", {"name": "SeriesSearch", "seriesId": 3}),
+        ("radarr", {"name": "MoviesSearch", "movieIds": [3]}),
+        ("lidarr", {"name": "ArtistSearch", "artistId": 3}),
+    ],
+)
+async def test_search_item_posts_a_bounded_command(
+    make_client: ClientFactory, service: ArrService, body: dict[str, Any]
+) -> None:
+    transport = RecordingTransport(write_backend([]))
+    seen = transport.requests
+    result = await make_client(transport).search_item(service, 3)
+    post = seen[0]
+    assert post.method == "POST"
+    assert post.url.path.endswith("/command")
+    assert json.loads(post.content) == body
+    assert result == {
+        "service": service,
+        "command": {"command_id": 9, "name": body["name"], "status": "queued"},
     }
 
 
@@ -1675,7 +2054,12 @@ async def test_delete_media_rejects_unbound_tampered_or_expired_confirmation(
 
 @pytest.fixture
 def write_upstream() -> RecordingTransport:
-    item = {"id": 3, "title": "Item", "monitored": True}
+    item = {
+        "id": 3,
+        "title": "Item",
+        "monitored": True,
+        "seasons": [{"seasonNumber": 1, "monitored": True}],
+    }
     return RecordingTransport(write_backend([SONARR_CANDIDATE], item=item))
 
 
@@ -1717,6 +2101,10 @@ def test_write_tools_appear_only_behind_their_gates(
     assert annotations["arr_request_media"]["readOnlyHint"] is False
     assert annotations["arr_request_media"]["idempotentHint"] is False
     assert annotations["arr_unmonitor_media"]["idempotentHint"] is True
+    assert annotations["arr_monitor_media"]["idempotentHint"] is True
+    assert annotations["arr_set_season_monitoring"]["idempotentHint"] is True
+    assert annotations["arr_set_album_monitored"]["idempotentHint"] is True
+    assert annotations["arr_search_item"]["readOnlyHint"] is False
     assert annotations["arr_delete_media"]["readOnlyHint"] is False
     assert annotations["arr_delete_media"]["destructiveHint"] is True
 
@@ -1743,6 +2131,56 @@ def test_request_and_unmonitor_answer_over_streamable_http(
     assert not unmonitored.get("isError")
     assert unmonitored["structuredContent"]["item"]["monitored"] is False
     assert any(r.method == "PUT" for r in write_upstream.requests)
+
+
+def test_granular_write_tools_answer_over_streamable_http(
+    mcp_writes: TestClient,
+) -> None:
+    monitored = call_tool(mcp_writes, "arr_monitor_media", service="sonarr", item_id=3)
+    assert not monitored.get("isError")
+    assert monitored["structuredContent"]["item"]["monitored"] is True
+    seasons = call_tool(
+        mcp_writes,
+        "arr_set_season_monitoring",
+        service="sonarr",
+        item_id=3,
+        seasons=[1],
+        monitored=False,
+    )
+    assert not seasons.get("isError")
+    assert seasons["structuredContent"]["seasons"] == [
+        {"season_number": 1, "monitored": False}
+    ]
+    album = call_tool(
+        mcp_writes,
+        "arr_set_album_monitored",
+        service="lidarr",
+        album_id=11,
+        monitored=False,
+    )
+    assert not album.get("isError")
+    assert album["structuredContent"]["album"] == {
+        "album_id": 11,
+        "title": "Example Album",
+        "monitored": False,
+    }
+    search = call_tool(mcp_writes, "arr_search_item", service="sonarr", item_id=3)
+    assert not search.get("isError")
+    assert search["structuredContent"]["command"] == {
+        "command_id": 9,
+        "name": "SeriesSearch",
+        "status": "queued",
+    }
+    delete = call_tool(
+        mcp_writes,
+        "arr_delete_media",
+        service="lidarr",
+        item_id=42,
+        album_id=11,
+    )
+    assert not delete.get("isError")
+    assert delete["structuredContent"]["item"]["album_id"] == 11
+    assert delete["structuredContent"]["confirmation_required"] is True
 
 
 def test_delete_media_flows_over_streamable_http_with_confirmation(
@@ -1809,6 +2247,48 @@ def test_delete_media_flows_over_streamable_http_with_confirmation(
         ),
         ("arr_unmonitor_media", {"service": "sonarr", "item_id": 0}, "item_id"),
         ("arr_delete_media", {"service": "sonarr", "item_id": 2**31}, "item_id"),
+        (
+            "arr_delete_media",
+            {"service": "lidarr", "item_id": 3, "album_id": 0},
+            "album_id",
+        ),
+        (
+            "arr_request_media",
+            {
+                "service": "sonarr",
+                "external_id": "81189",
+                "quality_profile_id": 7,
+                "root_folder_path": "/media",
+                "seasons": [],
+            },
+            "seasons",
+        ),
+        (
+            "arr_request_media",
+            {
+                "service": "sonarr",
+                "external_id": "81189",
+                "quality_profile_id": 7,
+                "root_folder_path": "/media",
+                "seasons": [1001],
+            },
+            "seasons",
+        ),
+        (
+            "arr_set_season_monitoring",
+            {
+                "service": "sonarr",
+                "item_id": 3,
+                "seasons": [1] * 101,
+                "monitored": True,
+            },
+            "seasons",
+        ),
+        (
+            "arr_set_album_monitored",
+            {"service": "lidarr", "album_id": 0, "monitored": True},
+            "album_id",
+        ),
         (
             "arr_delete_media",
             {"service": "sonarr", "item_id": 3, "confirmation": "x" * 129},

@@ -1,7 +1,8 @@
 """Configuration and secret-file handling for the media broker."""
 
-# Write tools are opt-in: requests enable brokered adds and unmonitoring, and
-# deletes enable the two-phase destructive media removal tool.
+# Write tools are opt-in: requests enable brokered adds, monitoring changes,
+# and search triggers, while deletes enable the two-phase destructive media
+# removal tool.
 
 import os
 from collections.abc import Callable
