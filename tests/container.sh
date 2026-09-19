@@ -165,7 +165,8 @@ for request_body in (
     if request_body["method"] == "tools/list":
         assert {tool["name"] for tool in result["tools"]} == {
             "arr_library_inventory", "arr_quality_profiles", "arr_root_folders",
-            "arr_search_candidates", "tautulli_play_history", "jellyfin_play_history"
+            "arr_search_candidates", "arr_season_inventory", "arr_album_inventory",
+            "tautulli_play_history", "jellyfin_play_history", "jellyfin_users"
         }
     else:
         assert json.loads(result["content"][0]["text"])["items"] == []
