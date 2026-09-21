@@ -6,7 +6,7 @@ production deployment (Portainer stack, host firewall, secret files) is owned
 by the [`mich-murphy/home-infra`](https://github.com/mich-murphy/home-infra)
 repository; see its `docs/hermes-media.md` for the deployment runbook.
 
-This project exposes a small MCP server over the official Python SDK's
+This project exposes a small MCP server over the official Rust SDK's (`rmcp`)
 Streamable HTTP transport. The adapters target Sonarr 4.0.19 (API v3), Radarr
 6.3.0 (API v3), Lidarr 3.1.0 (API v1), Tautulli 2.18.1, and the Jellyfin
 Playback Reporting plugin (v19).
@@ -72,7 +72,7 @@ flip monitoring below the item level and are likewise reversible.
 
 `arr_delete_media` removes one item and is destructive. It always runs in two
 phases: the first call returns a preview of the projected item plus a
-five-minute signed confirmation token (`itsdangerous`) bound to the exact
+five-minute HMAC-SHA256 signed confirmation token bound to the exact
 action (service, item id, album id, and file mode), and only a second call
 carrying that token executes the delete. For Lidarr, an optional `album_id`
 deletes a single album instead of the artist; the preview then shows both the
@@ -101,8 +101,10 @@ export JELLYFIN_URL=http://127.0.0.1:8096
 export JELLYFIN_API_KEY_FILE=/run/user/1000/media-broker/jellyfin
 export MEDIA_BROKER_ALLOWED_HOSTS=127.0.0.1:8000
 export MEDIA_BROKER_ALLOWED_ORIGINS=http://127.0.0.1:8000
-uv run media-broker
+cargo run --release
 ```
+
+`nix develop` (or direnv) provides the Rust toolchain.
 
 All five upstreams and all secret files are required, and a secret file that is
 world-readable is refused at startup. The broker defaults to loopback binding,
@@ -151,21 +153,20 @@ profile, and album ids within int32, season selections of 1-100 season numbers
 between 0 and 1000, candidate lists of at most 100, confirmation tokens up to
 128 characters) are declared in
 each tool's input schema, so clients see them before calling. Rejected
-arguments, upstream failures, and unexpected errors are all reported through the
-MCP `isError` result with a sanitized message; upstream bodies, URLs, and keys
-never reach the caller. Responses use the Streamable HTTP JSON mode because the
+arguments and upstream failures are reported through the MCP `isError` result
+with a sanitized message naming the offending argument; every tool error is one
+of those two typed kinds, so upstream bodies, URLs, and keys never reach the
+caller. Responses use the Streamable HTTP JSON mode because the
 server is stateless and never streams server-initiated messages.
 
-CI enforces formatting, linting, cyclomatic complexity (McCabe 8), strict type
-checking, tests, a dependency vulnerability audit, and an image build:
+CI enforces formatting, Clippy lints (pedantic group, warnings denied), tests,
+a dependency vulnerability audit, and an image build:
 
 ```sh
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest
-uv export --no-dev --no-emit-project --no-hashes -o requirements.txt
-uv run pip-audit --strict --disable-pip --no-deps -r requirements.txt
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo audit
 ```
 
 ## Container image
@@ -178,9 +179,10 @@ CI builds the image on every merge to `main` and publishes it to GHCR as:
   rollback and auditing.
 
 The image is private to the `mich-murphy` account. Its runtime stage contains
-only the virtual environment (no pip, uv, or source tree), runs as UID/GID
-65532 with a read-only filesystem, listens on container port 8000, and expects
-all credentials as file paths (`*_FILE` variables), never values.
+only the binary on a distroless base (no shell, toolchain, or source tree),
+runs as UID/GID 65532 with a read-only filesystem, listens on container port
+8000, and expects all credentials as file paths (`*_FILE` variables), never
+values.
 
 `tests/container.sh` performs an isolated local build-and-probe against fake
 upstreams using the `desktop-linux` Docker context; it creates and removes

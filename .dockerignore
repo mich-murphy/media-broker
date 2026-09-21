@@ -1,9 +1,6 @@
 .git
-.venv
-.pytest_cache
-.ruff_cache
-.mypy_cache
-__pycache__
+target
+.direnv
 tests
 .env*
 secrets

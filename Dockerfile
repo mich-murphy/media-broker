@@ -1,17 +1,23 @@
-FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS build
+FROM rust:1.98-slim-trixie@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS build
 
 WORKDIR /app
-COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir uv==0.12.5 \
-    && uv sync --locked --no-dev --no-install-project
+# Compile the locked dependencies against placeholder targets so this layer is
+# reused until Cargo.toml or Cargo.lock changes.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && touch src/lib.rs \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked
+# COPY keeps the context's mtimes; touch makes cargo rebuild the real crate.
 COPY src ./src
-RUN uv sync --locked --no-dev --no-editable
+RUN touch src/lib.rs src/main.rs \
+    && cargo build --release --locked
 
-# The runtime image carries only the virtual environment: no pip, uv, or source tree.
-FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+# The runtime image carries only the binary: no toolchain, cargo, or source tree.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 
-COPY --from=build /app/.venv /app/.venv
+COPY --from=build /app/target/release/media-broker /usr/local/bin/media-broker
 USER 65532:65532
 EXPOSE 8000
 ENV MEDIA_BROKER_BIND_HOST=127.0.0.1
-CMD ["/app/.venv/bin/media-broker"]
+CMD ["/usr/local/bin/media-broker"]
