@@ -17,22 +17,23 @@ jobs:
   test:
     name: Quality gate
     runs-on: ubuntu-latest
+    env:
+      # renovate: datasource=github-releases depName=rust-lang/rust
+      RUST_VERSION: 1.98.1
+      # renovate: datasource=crate depName=cargo-audit
+      CARGO_AUDIT_VERSION: 0.22.2
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Format, lint, type-check, test, audit
+      - name: Format, lint, test, audit
         run: |
-          python3 -m venv "${RUNNER_TEMP}/uv-home"
-          "${RUNNER_TEMP}/uv-home/bin/pip" install --disable-pip-version-check --no-cache-dir uv==0.12.5
-          export UV_PROJECT_ENVIRONMENT="${RUNNER_TEMP}/media-broker-python"
-          uv() { "${RUNNER_TEMP}/uv-home/bin/uv" "$@"; }
-          uv sync --locked --all-groups
-          uv run --locked ruff format --check .
-          uv run --locked ruff check .
-          uv run --locked mypy
-          uv run --locked pytest -q
-          uv export --locked --no-dev --no-emit-project --no-hashes -o "${RUNNER_TEMP}/requirements.txt"
-          uv run --locked pip-audit --strict --disable-pip --no-deps -r "${RUNNER_TEMP}/requirements.txt"
+          rustup toolchain install "${RUST_VERSION}" --profile minimal --component clippy,rustfmt
+          export RUSTUP_TOOLCHAIN="${RUST_VERSION}"
+          cargo install --locked --root "${RUNNER_TEMP}/cargo-audit" cargo-audit --version "${CARGO_AUDIT_VERSION}"
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          "${RUNNER_TEMP}/cargo-audit/bin/cargo-audit" audit
       - name: Build image
         run: docker build .
 

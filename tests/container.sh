@@ -27,6 +27,7 @@ secrets_volume="media-broker-secrets-${suffix}"
 backend="media-broker-backend-${suffix}"
 broker="media-broker-${suffix}"
 image="ghcr.io/mich-murphy/media-broker:test-${suffix}"
+# Helper image for the fake upstream and the secret files; the broker image has no Python.
 base='python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea'
 port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 fake_backend=$(mktemp)
@@ -151,7 +152,7 @@ def request(payload, token=None, host="docker-host:8765"):
         return error.code, error.read().decode()
 
 assert request(body)[0] == 401
-assert request(body, "media_broker_token_fake_token_0123456789abcdef", "wrong-host:8765")[0] == 421
+assert request(body, "media_broker_token_fake_token_0123456789abcdef", "wrong-host:8765")[0] == 403
 status, text = request(body, "media_broker_token_fake_token_0123456789abcdef")
 assert status == 200, (status, text)
 for request_body in (
