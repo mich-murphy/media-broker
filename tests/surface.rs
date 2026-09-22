@@ -10,10 +10,16 @@ use axum::{
     http::{HeaderValue, StatusCode},
 };
 use common::{
-    Broker, DELETE_TOOL, JELLYFIN_USER, READ_TOOLS, REQUEST_TOOLS, TOKEN, assert_contains, reply,
-    route_upstreams, with,
+    Broker, DELETE_TOOL, HASH_A, JELLYFIN_USER, READ_TOOLS, REQUEST_TOOLS, TOKEN, TORRENT_TOOLS,
+    assert_contains, qbit_backend, reply, route_upstreams, with, with_qbit,
 };
+use media_broker::config::{Service, Settings};
 use serde_json::{Value, json};
+
+/// The registered tool names as owned strings, for set comparisons.
+async fn tool_names(broker: &Broker) -> HashSet<String> {
+    broker.tools().await.keys().map(String::from).collect()
+}
 
 #[tokio::test]
 async fn every_request_without_exactly_one_valid_bearer_is_rejected() {
@@ -236,4 +242,117 @@ async fn write_tools_appear_only_behind_their_gates() {
             assert_eq!(hints(DELETE_TOOL), (false, true, false));
         }
     }
+}
+
+#[tokio::test]
+async fn health_answers_liveness_only_and_everything_else_needs_a_bearer() {
+    let broker = Broker::start(route_upstreams).await;
+    let get_health = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("host", "testserver")
+        .body(Body::empty())
+        .unwrap();
+    let reply = broker.send(get_health).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, json!({"status": "ok"}));
+    assert_eq!(reply.headers["cache-control"], "no-store");
+    assert!(!reply.headers.contains_key("server"));
+    // Any other method or path still falls through to the bearer boundary.
+    for (method, path) in [("POST", "/health"), ("GET", "/health/"), ("HEAD", "/health")] {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "testserver")
+            .body(Body::empty())
+            .unwrap();
+        let reply = broker.send(request).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert_eq!(reply.body, json!({"error": "authentication required"}));
+    }
+}
+
+#[tokio::test]
+async fn the_tool_surface_follows_the_configured_upstreams() {
+    let set = |names: &[&str]| names.iter().map(ToString::to_string).collect::<HashSet<_>>();
+    // One upstream only: exactly its own read tools appear.
+    let only = |keep: Service| {
+        move |settings: &mut Settings| {
+            for (index, slot) in settings.upstreams.iter_mut().enumerate() {
+                if Service::ALL[index] != keep {
+                    *slot = None;
+                }
+            }
+        }
+    };
+    let tautulli = Broker::configured(only(Service::Tautulli), route_upstreams).await;
+    assert_eq!(tool_names(&tautulli).await, set(&["tautulli_play_history"]));
+    let jellyfin = Broker::configured(only(Service::Jellyfin), route_upstreams).await;
+    assert_eq!(tool_names(&jellyfin).await, set(&["jellyfin_play_history", "jellyfin_users"]));
+    let sonarr = Broker::configured(only(Service::Sonarr), route_upstreams).await;
+    assert_eq!(
+        tool_names(&sonarr).await,
+        set(&[
+            "arr_library_inventory",
+            "arr_quality_profiles",
+            "arr_root_folders",
+            "arr_search_candidates",
+            "arr_season_inventory",
+        ])
+    );
+    // qBittorrent adds its three read tools; with every arr slot empty they
+    // are the whole surface.
+    let qbit = Broker::configured(
+        |settings| {
+            with_qbit(settings);
+            for service in [Service::Sonarr, Service::Radarr, Service::Lidarr] {
+                settings.upstreams[service as usize] = None;
+            }
+            settings.upstreams[Service::Tautulli as usize] = None;
+            settings.upstreams[Service::Jellyfin as usize] = None;
+        },
+        qbit_backend(json!([]), json!({}), true, true, false),
+    )
+    .await;
+    assert_eq!(tool_names(&qbit).await, set(&TORRENT_TOOLS));
+    // Torrent tools share the read-only annotations and bounded schemas.
+    let tools = qbit.tools().await;
+    for name in TORRENT_TOOLS {
+        let expected = json!({"readOnlyHint": true, "destructiveHint": false,
+                              "idempotentHint": true, "openWorldHint": false});
+        assert_contains(&tools[name]["annotations"], &expected, name);
+    }
+    let bounds =
+        |schema: &Value| (schema["minimum"].as_f64().unwrap(), schema["maximum"].as_f64().unwrap());
+    let inventory = &tools["torrent_client_inventory"]["inputSchema"];
+    // Every argument is optional, so schemars may omit `required` entirely.
+    assert!(inventory["required"].as_array().is_none_or(Vec::is_empty));
+    assert_eq!(bounds(&inventory["properties"]["page_size"]), (1.0, 100.0));
+    assert_eq!(inventory["properties"]["search"]["maxLength"], 200);
+    let hashes = &tools["torrent_client_check_paths"]["inputSchema"]["properties"]["hashes"];
+    assert_eq!(hashes["minItems"], 1);
+    assert_eq!(hashes["maxItems"], 100);
+    assert_eq!(hashes["items"]["maxLength"], 64);
+}
+
+#[tokio::test]
+async fn torrent_arguments_are_rejected_before_any_upstream_call() {
+    let broker =
+        Broker::configured(with_qbit, qbit_backend(json!([]), json!({}), true, true, false)).await;
+    let many: Vec<&str> = [HASH_A].repeat(101);
+    let long = "x".repeat(65);
+    let cases = [
+        ("torrent_client_inventory", json!({"page": 0}), "page"),
+        ("torrent_client_inventory", json!({"page_size": 101}), "page_size"),
+        ("torrent_client_inventory", json!({"search": "x".repeat(201)}), "search"),
+        ("torrent_client_check_paths", json!({"hashes": []}), "hashes"),
+        ("torrent_client_check_paths", json!({"hashes": many}), "hashes"),
+        ("torrent_client_check_paths", json!({"hashes": [long]}), "hashes"),
+        ("torrent_client_check_paths", json!({}), "hashes"),
+    ];
+    for (name, arguments, field) in cases {
+        let error = broker.err(name, arguments.clone()).await;
+        assert!(error.contains(field), "{name} {arguments}: {error}");
+    }
+    assert!(broker.seen().is_empty(), "{:?}", broker.seen());
 }

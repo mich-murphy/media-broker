@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fs, os::unix::fs::PermissionsExt, path::Path};
 
-use media_broker::config::{Service, Settings};
+use media_broker::config::{Auth, Service, Settings};
 use tempfile::TempDir;
 
 const TOKEN: &str = "broker-secret-token-0123456789abcdef";
@@ -27,9 +27,15 @@ impl Env {
         let mut vars = HashMap::from([("MEDIA_BROKER_TOKEN_FILE".to_owned(), token)]);
         for service in Service::ALL {
             let (name, env) = (service.name(), service.name().to_uppercase());
-            let key = secret_file(dir.path(), name, &format!("{name}-key"), 0o600);
             vars.insert(format!("{env}_URL"), format!("http://{name}.test"));
-            vars.insert(format!("{env}_API_KEY_FILE"), key);
+            if service == Service::Qbittorrent {
+                let password = secret_file(dir.path(), name, "qbittorrent-password", 0o600);
+                vars.insert("QBITTORRENT_USERNAME".to_owned(), "admin".to_owned());
+                vars.insert("QBITTORRENT_PASSWORD_FILE".to_owned(), password);
+            } else {
+                let key = secret_file(dir.path(), name, &format!("{name}-key"), 0o600);
+                vars.insert(format!("{env}_API_KEY_FILE"), key);
+            }
         }
         Self { dir, vars }
     }
@@ -91,7 +97,7 @@ fn urls_and_authorities_must_be_exact() {
         }
         let loaded = loaded.unwrap_or_else(|error| panic!("{name}={value}: {error}"));
         let stored = match name {
-            ENDPOINT => loaded.upstream(Service::Sonarr).base_url.clone(),
+            ENDPOINT => loaded.upstream(Service::Sonarr).unwrap().base_url.clone(),
             HOST => loaded.allowed_hosts[0].clone(),
             _ => loaded.allowed_origins[0].clone(),
         };
@@ -113,10 +119,18 @@ fn loopback_binding_defaults_to_its_exact_authority() {
 fn secrets_are_loaded_from_files_and_never_printed() {
     let loaded = Env::new().load(&[]).unwrap();
     assert_eq!(loaded.bearer_token.expose(), TOKEN);
-    assert_eq!(loaded.upstream(Service::Lidarr).api_key.expose(), "lidarr-key");
+    let lidarr = loaded.upstream(Service::Lidarr).unwrap();
+    let Auth::Key(key) = &lidarr.auth else { panic!("lidarr uses key auth") };
+    assert_eq!(key.expose(), "lidarr-key");
+    let qbit = loaded.upstream(Service::Qbittorrent).unwrap();
+    let Auth::Session { username, password } = &qbit.auth else {
+        panic!("qbittorrent uses session auth")
+    };
+    assert_eq!((username.as_str(), password.expose()), ("admin", "qbittorrent-password"));
     let printed = format!("{loaded:?} {loaded:#?}");
     assert!(printed.contains("lidarr.test"), "{printed}");
     assert!(!printed.contains("lidarr-key") && !printed.contains(TOKEN), "{printed}");
+    assert!(!printed.contains("qbittorrent-password"), "{printed}");
 }
 
 #[test]
@@ -142,8 +156,8 @@ fn unsafe_configuration_is_rejected() {
     let cases = [
         ("SONARR_API_KEY", Some("inline-secret"), "API_KEY_FILE"),
         ("JELLYFIN_API_KEY", Some("inline-secret"), "API_KEY_FILE"),
-        ("RADARR_URL", None, "missing required configuration: RADARR_URL"),
-        ("JELLYFIN_URL", None, "missing required configuration: JELLYFIN_URL"),
+        ("RADARR_URL", None, "RADARR_URL is required when RADARR_API_KEY_FILE is set"),
+        ("JELLYFIN_URL", None, "JELLYFIN_URL is required when JELLYFIN_API_KEY_FILE is set"),
         ("RADARR_API_KEY_FILE", Some("/nonexistent/key"), "regular secret file"),
         ("MEDIA_BROKER_BIND_HOST", Some("192.168.1.5"), "loopback"),
         ("MEDIA_BROKER_ALLOW_PUBLIC_BIND", Some("true"), "ALLOW_PUBLIC_BIND"),
@@ -175,6 +189,52 @@ fn bearer_token_file_must_be_private_and_well_formed() {
         let token = secret_file(env.dir.path(), "other-token", content, mode);
         env.rejects(&[("MEDIA_BROKER_TOKEN_FILE", Some(&token))], message);
     }
+}
+
+#[test]
+fn upstreams_are_optional_but_at_least_one_is_required() {
+    let env = Env::new();
+    let pairs = |prefixes: [&str; 4]| -> Vec<(String, Option<&str>)> {
+        prefixes
+            .into_iter()
+            .flat_map(|prefix| {
+                [(format!("{prefix}_URL"), None), (format!("{prefix}_API_KEY_FILE"), None)]
+            })
+            .collect()
+    };
+    let four = pairs(["SONARR", "RADARR", "LIDARR", "TAUTULLI"]);
+    let borrowed: Vec<(&str, Option<&str>)> =
+        four.iter().map(|(name, value)| (name.as_str(), *value)).collect();
+    let loaded = env.load(&borrowed).unwrap();
+    assert!(loaded.upstream(Service::Sonarr).is_none());
+    assert!(loaded.upstream(Service::Jellyfin).is_some());
+    assert!(loaded.upstream(Service::Qbittorrent).is_some());
+}
+
+#[test]
+fn no_upstream_at_all_is_rejected() {
+    let env = Env::new();
+    let mut all: Vec<(String, Option<&str>)> = Vec::new();
+    for prefix in ["SONARR", "RADARR", "LIDARR", "TAUTULLI", "JELLYFIN"] {
+        all.push((format!("{prefix}_URL"), None));
+        all.push((format!("{prefix}_API_KEY_FILE"), None));
+    }
+    for name in ["QBITTORRENT_URL", "QBITTORRENT_USERNAME", "QBITTORRENT_PASSWORD_FILE"] {
+        all.push((name.to_owned(), None));
+    }
+    let borrowed: Vec<(&str, Option<&str>)> =
+        all.iter().map(|(name, value)| (name.as_str(), *value)).collect();
+    env.rejects(&borrowed, "at least one upstream must be configured");
+}
+
+#[test]
+fn qbittorrent_upstream_requires_a_full_triple() {
+    let env = Env::new();
+    env.rejects(&[("QBITTORRENT_USERNAME", None)], "QBITTORRENT_USERNAME");
+    env.rejects(&[("QBITTORRENT_PASSWORD_FILE", None)], "QBITTORRENT_PASSWORD_FILE");
+    let dangling = [("QBITTORRENT_URL", None), ("QBITTORRENT_PASSWORD_FILE", None)];
+    env.rejects(&dangling, "QBITTORRENT_URL is required");
+    env.rejects(&[("QBITTORRENT_PASSWORD", Some("inline-secret"))], "QBITTORRENT_PASSWORD_FILE");
 }
 
 #[test]

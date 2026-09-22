@@ -20,4 +20,8 @@ COPY --from=build /app/target/release/media-broker /usr/local/bin/media-broker
 USER 65532:65532
 EXPOSE 8000
 ENV MEDIA_BROKER_BIND_HOST=127.0.0.1
+# The distroless runtime has no shell, curl, or wget; the binary probes its
+# own health route and exits nonzero on any non-2xx answer.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/media-broker", "--healthcheck"]
 CMD ["/usr/local/bin/media-broker"]

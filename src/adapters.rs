@@ -1,8 +1,9 @@
 //! Small adapters with bounded responses and explicit projections.
 //!
-//! Read tools are always available. Write tools (request, unmonitor, delete) are
-//! gated in the server; deletions additionally require a short-lived signed
-//! confirmation bound to the exact action parameters.
+//! Read tools are available when their upstream is configured. Write tools
+//! (request, unmonitor, delete) are gated in the server; deletions
+//! additionally require a short-lived signed confirmation bound to the exact
+//! action parameters.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -17,14 +18,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 
-use crate::config::{Service, Settings};
+use crate::config::{Auth, Service, Settings};
 
 const MAX_ITEMS: usize = 10_000;
 const MAX_PROJECTED_STRING: usize = 1024;
 const MAX_LIST_ENTRIES: usize = 16;
 const MAX_SEASON_ENTRIES: usize = 64;
 const MAX_REQUEST_BYTES: usize = 262_144;
+const MAX_HASHES: usize = 100;
 const DELETE_ACTION: &str = "arr_delete_media";
 // Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
 const WATCHED_STATUSES: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
@@ -317,10 +320,12 @@ fn date_range(start: Date, end: Date) -> Result<()> {
     parameter(DATE_RANGE)
 }
 
-/// HTTP client for the five allow-listed upstream APIs.
+/// HTTP client for the allow-listed upstream APIs.
 pub struct MediaClient {
     settings: Settings,
     http: reqwest::Client,
+    /// The qBittorrent session id, held server-side and never projected.
+    qbit_sid: Mutex<Option<String>>,
 }
 
 impl MediaClient {
@@ -329,29 +334,41 @@ impl MediaClient {
     pub fn new(settings: Settings) -> Self {
         let builder = reqwest::Client::builder().redirect(Policy::none()).no_proxy();
         let http = builder.build().expect("the HTTP client initializes");
-        Self { settings, http }
+        Self { settings, http, qbit_sid: Mutex::new(None) }
     }
 
-    /// Address one upstream path; the key travels in a header, never the URL.
-    fn request(&self, service: impl Into<Service>, method: Method, path: &str) -> RequestBuilder {
+    /// Address one upstream path; credentials travel in headers, never the URL.
+    fn request(
+        &self,
+        service: impl Into<Service>,
+        method: Method,
+        path: &str,
+    ) -> Result<RequestBuilder> {
         let service = service.into();
-        let upstream = self.settings.upstream(service);
+        let Some(upstream) = self.settings.upstream(service) else {
+            return parameter(format!("{} is not configured on this broker", service.name()));
+        };
         let url = format!("{}{}{path}", upstream.base_url, service.api_root());
         let request = self.http.request(method, url);
-        request.header(service.key_header(), upstream.api_key.expose())
+        Ok(match &upstream.auth {
+            Auth::Key(key) => {
+                let header = service.key_header().expect("key auth names a header");
+                request.header(header, key.expose())
+            }
+            // Session auth attaches its cookie inside the qBittorrent exchange.
+            Auth::Session { .. } => request,
+        })
     }
 
-    /// Send one request under a total deadline, returning a size-capped body.
-    async fn fetch(&self, request: RequestBuilder) -> Result<Vec<u8>> {
+    /// Send one request under a total deadline, returning the status and a
+    /// size-capped body without judging the status.
+    async fn exchange(&self, request: RequestBuilder) -> Result<(u16, Vec<u8>)> {
         let limit = self.settings.max_response_bytes;
         let exchange = async {
             let Ok(mut response) = request.send().await else {
                 return upstream(FAILED);
             };
             let status = response.status().as_u16();
-            if status >= 300 {
-                return upstream(format!("upstream returned HTTP {status}"));
-            }
             if response.content_length().unwrap_or(0) > limit as u64 {
                 return upstream(OVERSIZED);
             }
@@ -362,10 +379,19 @@ impl MediaClient {
                     return upstream(OVERSIZED);
                 }
             }
-            Ok(body)
+            Ok((status, body))
         };
         let deadline = tokio::time::timeout(self.settings.timeout, exchange);
         deadline.await.unwrap_or_else(|_| upstream("upstream request timed out"))
+    }
+
+    /// One exchange that rejects any HTTP error status.
+    async fn fetch(&self, request: RequestBuilder) -> Result<Vec<u8>> {
+        let (status, body) = self.exchange(request).await?;
+        if status >= 300 {
+            return upstream(format!("upstream returned HTTP {status}"));
+        }
+        Ok(body)
     }
 
     async fn json(&self, request: RequestBuilder) -> Result {
@@ -389,7 +415,7 @@ impl MediaClient {
         path: &str,
         query: &[(&str, String)],
     ) -> Result<Vec<Value>> {
-        let request = self.request(service, Method::GET, path).query(query);
+        let request = self.request(service, Method::GET, path)?.query(query);
         match self.json(request).await? {
             Value::Array(rows) if rows.len() <= MAX_ITEMS => {
                 Ok(rows.into_iter().filter(Value::is_object).collect())
@@ -407,7 +433,7 @@ impl MediaClient {
         if content.len() > MAX_REQUEST_BYTES {
             return parameter("request payload exceeds the broker limit");
         }
-        let request = self.request(service, method, path).body(content);
+        let request = self.request(service, method, path)?.body(content);
         self.record(request.header(CONTENT_TYPE, "application/json")).await
     }
 
@@ -418,13 +444,13 @@ impl MediaClient {
 
     /// Fetch one library record.
     async fn item(&self, service: ArrService, item_id: u32) -> Result {
-        self.record(self.request(service, Method::GET, &service.item_path(item_id))).await
+        self.record(self.request(service, Method::GET, &service.item_path(item_id))?).await
     }
 
     /// Flip the monitored flag of the record at `path`; everything else
     /// round-trips untouched. Returns the updated upstream record.
     async fn set_monitored(&self, service: ArrService, path: &str, monitored: bool) -> Result {
-        let mut record = self.record(self.request(service, Method::GET, path)).await?;
+        let mut record = self.record(self.request(service, Method::GET, path)?).await?;
         record["monitored"] = json!(monitored);
         self.write(service, Method::PUT, path, &record).await
     }
@@ -690,7 +716,7 @@ impl MediaClient {
             }
             Some(album_id) => {
                 let path = format!("/album/{album_id}");
-                let request = self.request(service, Method::GET, &path);
+                let request = self.request(service, Method::GET, &path)?;
                 let album = self.record(request).await?;
                 if album["artistId"].as_i64() != Some(item_id.into()) {
                     return parameter("album_id does not belong to item_id");
@@ -712,7 +738,7 @@ impl MediaClient {
         let now = Timestamp::now().as_second();
         if let Some(token) = confirmation {
             self.confirmation_must_match(&action, token, now)?;
-            let request = self.request(service, Method::DELETE, &path).query(&query);
+            let request = self.request(service, Method::DELETE, &path)?.query(&query);
             self.fetch(request).await?;
             outcome["deleted"] = json!(true);
         } else {
@@ -763,7 +789,7 @@ impl MediaClient {
         date_range(start, end)?;
         let offset = u64::from(page - 1) * u64::from(page_size);
         let request = self
-            .request(Service::Tautulli, Method::GET, "")
+            .request(Service::Tautulli, Method::GET, "")?
             .query(&[("cmd", "get_history")])
             .query(&[("start", offset), ("length", page_size.into())])
             .query(&[("media_type", media_type)])
@@ -860,7 +886,7 @@ impl MediaClient {
         let mut total = 0;
         for day in start.series(1.day()).take_while(|day| *day <= end) {
             let path = format!("/user_usage_stats/{user_id}/{day}/GetItems");
-            let request = self.request(Service::Jellyfin, Method::GET, &path).query(&query);
+            let request = self.request(Service::Jellyfin, Method::GET, &path)?.query(&query);
             let payload = self.json(request).await?;
             let rows = match payload.as_array() {
                 Some(rows) if rows.iter().all(Value::is_object) => rows,
@@ -908,4 +934,224 @@ impl MediaClient {
         let items: Vec<Value> = rows.iter().map(project).collect();
         Ok(json!({"items": items, "upstream_truncated": false}))
     }
+
+    /// Log in to qBittorrent; the session id stays server-side only.
+    ///
+    /// The login answer carries the cookie in its headers, so it runs its own
+    /// bounded exchange rather than [`MediaClient::fetch`].
+    async fn qbit_login(&self) -> Result<String> {
+        let Some(qbit) = self.settings.upstream(Service::Qbittorrent) else {
+            return parameter("qbittorrent is not configured on this broker");
+        };
+        let Auth::Session { username, password } = &qbit.auth else {
+            return parameter("qbittorrent is not configured on this broker");
+        };
+        let url = format!("{}{}/auth/login", qbit.base_url, Service::Qbittorrent.api_root());
+        let form = [("username", username.as_str()), ("password", password.expose())];
+        let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+        if body.len() > MAX_REQUEST_BYTES {
+            return parameter("qBittorrent credentials exceed the broker limit");
+        }
+        let request = self
+            .http
+            .request(Method::POST, url)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body);
+        let limit = self.settings.max_response_bytes;
+        let attempt = async {
+            let Ok(mut response) = request.send().await else {
+                return upstream(FAILED);
+            };
+            let status = response.status().as_u16();
+            let sid =
+                response.headers().get_all(reqwest::header::SET_COOKIE).iter().find_map(|value| {
+                    let value = value.to_str().ok()?;
+                    let sid = value.strip_prefix("SID=")?.split(';').next()?;
+                    valid_sid(sid).then(|| sid.to_owned())
+                });
+            if response.content_length().unwrap_or(0) > limit as u64 {
+                return upstream(OVERSIZED);
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.or_else(|_| upstream(FAILED))? {
+                body.extend_from_slice(&chunk);
+                if body.len() > limit {
+                    return upstream(OVERSIZED);
+                }
+            }
+            Ok((status, sid, body))
+        };
+        let deadline = tokio::time::timeout(self.settings.timeout, attempt);
+        let (status, sid, body) =
+            deadline.await.unwrap_or_else(|_| upstream("upstream request timed out"))?;
+        let accepted = status < 300 && body.trim_ascii() == b"Ok.";
+        let Some(sid) = sid.filter(|_| accepted) else {
+            return upstream("upstream authentication failed");
+        };
+        *self.qbit_sid.lock().await = Some(sid.clone());
+        Ok(sid)
+    }
+
+    /// GET one qBittorrent path, re-authenticating exactly once on a 403.
+    async fn qbit_fetch(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>> {
+        for retried in [false, true] {
+            let cached = self.qbit_sid.lock().await.clone();
+            let sid = match cached {
+                Some(sid) => sid,
+                None => self.qbit_login().await?,
+            };
+            let request = self
+                .request(Service::Qbittorrent, Method::GET, path)?
+                .header(reqwest::header::COOKIE, format!("SID={sid}"))
+                .query(query);
+            let (status, body) = self.exchange(request).await?;
+            if status == 403 && !retried {
+                *self.qbit_sid.lock().await = None;
+                continue;
+            }
+            if status >= 300 {
+                return upstream(format!("upstream returned HTTP {status}"));
+            }
+            return Ok(body);
+        }
+        upstream(FAILED)
+    }
+
+    /// GET and parse one qBittorrent API path under the pinned version.
+    async fn qbit_json(&self, path: &str, query: &[(&str, String)]) -> Result {
+        let body = self.qbit_fetch(path, query).await?;
+        serde_json::from_slice(&body).or_else(|_| upstream("upstream returned invalid JSON"))
+    }
+
+    /// Fetch a bounded list of qBittorrent torrents, dropping anything else.
+    async fn qbit_torrents(&self, query: &[(&str, String)]) -> Result<Vec<Value>> {
+        match self.qbit_json("/torrents/info", query).await? {
+            Value::Array(rows) if rows.len() <= MAX_ITEMS => {
+                Ok(rows.into_iter().filter(Value::is_object).collect())
+            }
+            _ => upstream("upstream returned an unexpected torrents response"),
+        }
+    }
+
+    /// Project global transfer totals, speeds, and connection status.
+    pub async fn torrent_stats(&self) -> Result {
+        let payload = self.qbit_json("/transfer/info", &[]).await?;
+        if !payload.is_object() {
+            return upstream("upstream returned an unexpected transfer response");
+        }
+        Ok(json!({
+            "service": "qbittorrent",
+            "connection_status": text(&payload["connection_status"]),
+            "dht_nodes": payload["dht_nodes"].as_i64(),
+            "download_speed_bytes": payload["dl_info_speed"].as_i64(),
+            "downloaded_bytes": payload["dl_info_data"].as_i64(),
+            "download_rate_limit_bytes": payload["dl_rate_limit"].as_i64(),
+            "upload_speed_bytes": payload["up_info_speed"].as_i64(),
+            "uploaded_bytes": payload["up_info_data"].as_i64(),
+            "upload_rate_limit_bytes": payload["up_rate_limit"].as_i64(),
+        }))
+    }
+
+    /// Project a bounded, locally paginated page of torrent swarm state.
+    pub async fn torrent_inventory(
+        &self,
+        page: u32,
+        page_size: u32,
+        search: Option<&str>,
+    ) -> Result {
+        let rows = self.qbit_torrents(&[]).await?;
+        let mut items: Vec<Value> = rows.iter().map(torrent_item).collect();
+        let query = search.unwrap_or_default().trim().to_lowercase();
+        let name = |item: &Value| item["name"].as_str().unwrap_or_default().to_lowercase();
+        items.retain(|item| name(item).contains(&query));
+        let (total, size) = (items.len(), page_size as usize);
+        let paged = items.into_iter().skip((page as usize - 1) * size).take(size);
+        let items: Vec<Value> = paged.collect();
+        let pagination = local_page(page, page_size, items.len(), total);
+        Ok(json!({"service": "qbittorrent", "items": items, "pagination": pagination}))
+    }
+
+    /// Report which requested info-hashes are present with complete data.
+    ///
+    /// Completeness is the client's recorded progress. Verifying bytes on
+    /// disk requires a recheck, which is a write and out of scope.
+    pub async fn torrent_check_paths(&self, hashes: &[String]) -> Result {
+        let mut normalized: Vec<String> = Vec::new();
+        for hash in hashes {
+            let hash = hash.trim().to_lowercase();
+            if !normalized.contains(&hash) {
+                normalized.push(hash);
+            }
+        }
+        if normalized.is_empty() || normalized.len() > MAX_HASHES {
+            return parameter("hashes must contain between 1 and 100 torrent hashes");
+        }
+        let valid = |hash: &str| {
+            matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        if normalized.iter().any(|hash| !valid(hash)) {
+            return parameter("torrent hashes must be 40 or 64 hexadecimal characters");
+        }
+        let query = [("hashes", normalized.join("|"))];
+        let rows = self.qbit_torrents(&query).await?;
+        let mut found: HashMap<String, &Value> = HashMap::new();
+        for row in &rows {
+            if let Some(hash) = text(&row["hash"]) {
+                let key = hash.to_lowercase();
+                if normalized.contains(&key) {
+                    found.insert(key, row);
+                }
+            }
+        }
+        let items: Vec<Value> = normalized
+            .iter()
+            .map(|hash| match found.get(hash) {
+                Some(row) => path_check_item(row),
+                None => json!({"hash": hash, "present": false}),
+            })
+            .collect();
+        Ok(json!({
+            "service": "qbittorrent",
+            "requested_count": normalized.len(),
+            "found_count": found.len(),
+            "items": items,
+        }))
+    }
+}
+
+/// qBittorrent session ids are short ASCII tokens; anything else is untrusted.
+fn valid_sid(sid: &str) -> bool {
+    let token = sid.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte));
+    !sid.is_empty() && sid.len() <= 256 && token
+}
+
+/// Project one torrent row to its allow-listed swarm fields.
+fn torrent_item(row: &Value) -> Value {
+    json!({
+        "hash": text(&row["hash"]),
+        "name": text(&row["name"]),
+        "state": text(&row["state"]),
+        "size_bytes": row["size"].as_i64(),
+        "progress": row["progress"].as_number(),
+        "ratio": row["ratio"].as_number(),
+        "seeding_time_seconds": row["seeding_time"].as_i64(),
+        "save_path": text(&row["save_path"]),
+        "added_on": row["added_on"].as_i64(),
+        "amount_left_bytes": row["amount_left"].as_i64(),
+    })
+}
+
+/// Project one torrent row for the reseed-candidate audit.
+fn path_check_item(row: &Value) -> Value {
+    let progress = row["progress"].as_f64();
+    json!({
+        "hash": text(&row["hash"]),
+        "present": true,
+        "name": text(&row["name"]),
+        "state": text(&row["state"]),
+        "progress": row["progress"].as_number(),
+        "amount_left_bytes": row["amount_left"].as_i64(),
+        "save_path": text(&row["save_path"]),
+        "data_complete": progress.map(|progress| progress >= 1.0),
+    })
 }

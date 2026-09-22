@@ -43,11 +43,26 @@ trap cleanup EXIT
 cat >"${fake_backend}" <<'PY'
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+QBIT_SID = "fake-qbit-session-id"
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/api/v2/"):
+            if self.headers.get("Cookie") != f"SID={QBIT_SID}":
+                self.send_error(403)
+                return
+            if path == "/api/v2/torrents/info":
+                body = []
+            elif path == "/api/v2/transfer/info":
+                body = {}
+            else:
+                self.send_error(404)
+                return
+            self.answer(body)
+            return
         expected = "fake-upstream-key"
         if path.startswith("/user_usage_stats/"):
             authorized = self.headers.get("X-Emby-Token") == expected
@@ -67,6 +82,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
             return
+        self.answer(body)
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/api/v2/auth/login":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        form = parse_qs(self.rfile.read(length).decode())
+        accepted = form.get("username") == ["admin"] and form.get("password") == ["fake-qbit-password"]
+        body = b"Ok." if accepted else b"Fails."
+        self.send_response(200)
+        if accepted:
+            self.send_header("Set-Cookie", f"SID={QBIT_SID}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def answer(self, body):
         encoded = json.dumps(body).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -86,9 +118,10 @@ docker_cmd volume create "${secrets_volume}" >/dev/null
 # shellcheck disable=SC2016 # expansion is intentional inside the container shell
 docker_cmd run --rm --user 0 -v "${secrets_volume}:/run/secrets" "${base}" sh -ec '
   umask 027
-  for name in media_broker_token sonarr_api_key radarr_api_key lidarr_api_key tautulli_api_key jellyfin_api_key; do
+  for name in media_broker_token sonarr_api_key radarr_api_key lidarr_api_key tautulli_api_key jellyfin_api_key qbittorrent_password; do
     value=fake-upstream-key
     [ "${name}" = media_broker_token ] && value=media_broker_token_fake_token_0123456789abcdef
+    [ "${name}" = qbittorrent_password ] && value=fake-qbit-password
     printf "%s" "${value}" > "/run/secrets/${name}"
     chown 65532:65532 "/run/secrets/${name}"
     chmod 0440 "/run/secrets/${name}"
@@ -110,6 +143,8 @@ docker_cmd run -d --name "${broker}" --network "${network}" -p "127.0.0.1:${port
   -e LIDARR_API_KEY_FILE=/run/secrets/lidarr_api_key \
   -e TAUTULLI_API_KEY_FILE=/run/secrets/tautulli_api_key \
   -e JELLYFIN_API_KEY_FILE=/run/secrets/jellyfin_api_key \
+  -e QBITTORRENT_URL=http://"${backend}":8080 -e QBITTORRENT_USERNAME=admin \
+  -e QBITTORRENT_PASSWORD_FILE=/run/secrets/qbittorrent_password \
   -e MEDIA_BROKER_TOKEN_FILE=/run/secrets/media_broker_token \
   -e MEDIA_BROKER_BIND_HOST=0.0.0.0 -e MEDIA_BROKER_ALLOW_PUBLIC_BIND=true \
   -e MEDIA_BROKER_ALLOWED_HOSTS=docker-host:8765 \
@@ -125,6 +160,13 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [[ "${ready}" == true ]] || { echo 'broker did not become ready' >&2; exit 1; }
+healthy=false
+for _ in $(seq 1 60); do
+  status="$(docker_cmd inspect --format '{{.State.Health.Status}}' "${broker}" 2>/dev/null || true)"
+  [[ "${status}" == healthy ]] && { healthy=true; break; }
+  sleep 1
+done
+[[ "${healthy}" == true ]] || { echo 'broker did not report healthy' >&2; exit 1; }
 python3 - "${port}" <<'PY'
 import json
 import sys
@@ -167,7 +209,8 @@ for request_body in (
         assert {tool["name"] for tool in result["tools"]} == {
             "arr_library_inventory", "arr_quality_profiles", "arr_root_folders",
             "arr_search_candidates", "arr_season_inventory", "arr_album_inventory",
-            "tautulli_play_history", "jellyfin_play_history", "jellyfin_users"
+            "tautulli_play_history", "jellyfin_play_history", "jellyfin_users",
+            "torrent_client_stats", "torrent_client_inventory", "torrent_client_check_paths"
         }
     else:
         assert json.loads(result["content"][0]["text"])["items"] == []
@@ -181,6 +224,28 @@ status, text = request(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/c
 }}).encode(), "media_broker_token_fake_token_0123456789abcdef")
 assert status == 200, (status, text)
 assert json.loads(json.loads(text)["result"]["content"][0]["text"])["items"] == []
+
+# The qBittorrent tools authenticate with the session cookie, not a header key.
+status, text = request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+    "name": "torrent_client_inventory", "arguments": {"page": 1, "page_size": 5}
+}}).encode(), "media_broker_token_fake_token_0123456789abcdef")
+assert status == 200, (status, text)
+assert json.loads(json.loads(text)["result"]["content"][0]["text"])["items"] == []
+
+# The health route answers exact GET probes without credentials; everything
+# else still requires the bearer token.
+def plain(method, path):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+
+status, text = plain("GET", "/health")
+assert status == 200 and json.loads(text) == {"status": "ok"}, (status, text)
+assert plain("POST", "/health")[0] == 401
+assert plain("GET", "/health/")[0] == 401
 PY
 
-echo 'Isolated build, authenticated MCP discovery/read, and unauthenticated rejection passed.'
+echo 'Isolated build, authenticated MCP discovery/read, health, and unauthenticated rejection passed.'

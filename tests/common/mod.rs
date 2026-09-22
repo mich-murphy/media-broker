@@ -17,7 +17,7 @@ use axum::{
     response::Response,
 };
 use media_broker::{
-    config::{Secret, Service, Settings, Upstream},
+    config::{Auth, Secret, Service, Settings, Upstream},
     server,
 };
 use serde_json::{Value, json};
@@ -46,6 +46,11 @@ pub const REQUEST_TOOLS: [&str; 6] = [
     "arr_search_item",
 ];
 pub const DELETE_TOOL: &str = "arr_delete_media";
+pub const TORRENT_TOOLS: [&str; 3] =
+    ["torrent_client_stats", "torrent_client_inventory", "torrent_client_check_paths"];
+pub const QBIT_SID: &str = "qbit-test-session-id";
+pub const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 /// One request as the fake upstream received it.
 #[derive(Clone, Debug)]
@@ -57,6 +62,8 @@ pub struct Seen {
     pub target: String,
     pub headers: HeaderMap,
     pub body: Value,
+    /// The raw body as text, for the form-encoded qBittorrent login.
+    pub text: String,
 }
 
 impl Seen {
@@ -107,6 +114,7 @@ impl Broker {
                     target: parts.uri.to_string(),
                     headers: parts.headers,
                     body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+                    text: String::from_utf8_lossy(&body).into_owned(),
                 };
                 let response = upstream(&record);
                 log.lock().unwrap().push(record);
@@ -119,9 +127,11 @@ impl Broker {
 
         let mut settings = Settings {
             bearer_token: Secret::new(TOKEN),
-            upstreams: Service::ALL.map(|service| Upstream {
-                base_url: base_url.clone(),
-                api_key: Secret::new(format!("{}-key", service.name())),
+            upstreams: Service::ALL.map(|service| {
+                (service != Service::Qbittorrent).then(|| Upstream {
+                    base_url: base_url.clone(),
+                    auth: Auth::Key(Secret::new(format!("{}-key", service.name()))),
+                })
             }),
             allowed_hosts: vec!["testserver".into()],
             allowed_origins: vec!["http://testserver".into()],
@@ -213,6 +223,75 @@ impl Broker {
 pub fn open_gates(settings: &mut Settings) {
     settings.enable_requests = true;
     settings.enable_deletes = true;
+}
+
+/// Point the qBittorrent slot at the fake upstream with session credentials.
+pub fn with_qbit(settings: &mut Settings) {
+    let base_url = settings.upstream(Service::Sonarr).unwrap().base_url.clone();
+    settings.upstreams[Service::Qbittorrent as usize] = Some(Upstream {
+        base_url,
+        auth: Auth::Session { username: "admin".to_owned(), password: Secret::new("secret") },
+    });
+}
+
+/// A fake qBittorrent `WebUI` with session-cookie authentication.
+/// `login_ok=false` refuses the login; `accept_session=false` rejects every
+/// session; `fail_first_get=true` answers the first authenticated GET with a
+/// 403 before accepting the refreshed session.
+#[allow(clippy::needless_pass_by_value)] // callers pass `json!` literals
+#[allow(clippy::fn_params_excessive_bools)] // named flags of one fake
+pub fn qbit_backend(
+    torrents: Value,
+    stats: Value,
+    login_ok: bool,
+    accept_session: bool,
+    fail_first_get: bool,
+) -> impl Fn(&Seen) -> Response + Send + Sync + 'static {
+    let first_get = Mutex::new(fail_first_get);
+    move |seen| {
+        if seen.path == "/api/v2/auth/login" {
+            if !login_ok {
+                return respond(200, "Fails.");
+            }
+            return Response::builder()
+                .status(200)
+                .header("set-cookie", format!("SID={QBIT_SID}"))
+                .body("Ok.".into())
+                .unwrap();
+        }
+        let expected = format!("SID={QBIT_SID}");
+        if !accept_session || seen.header("cookie") != Some(expected.as_str()) {
+            return respond(403, Body::empty());
+        }
+        let mut first = first_get.lock().unwrap();
+        if *first {
+            *first = false;
+            return respond(403, Body::empty());
+        }
+        drop(first);
+        match seen.path.as_str() {
+            "/api/v2/torrents/info" => respond(200, torrents.to_string()),
+            "/api/v2/transfer/info" => respond(200, stats.to_string()),
+            _ => respond(404, Body::empty()),
+        }
+    }
+}
+
+/// One torrent row carrying a field that must never pass through.
+pub fn torrent_row() -> Value {
+    json!({
+        "hash": HASH_A,
+        "name": "Example.Release.2024",
+        "state": "stoppedUP",
+        "size": 4_700_000_000_i64,
+        "progress": 1.0,
+        "ratio": 2.5,
+        "seeding_time": 864_000,
+        "save_path": "/mnt/data/torrents",
+        "added_on": 1_700_000_000,
+        "amount_left": 0,
+        "tracker": "must not pass",
+    })
 }
 
 pub fn respond(status: u16, body: impl Into<Body>) -> Response {

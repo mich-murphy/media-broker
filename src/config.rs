@@ -2,7 +2,7 @@
 //!
 //! Write tools are opt-in: requests enable brokered adds, monitoring changes,
 //! and search triggers, while deletes enable the two-phase destructive media
-//! removal tool.
+//! removal tool. Every upstream is optional, but at least one must be set.
 
 use std::{
     collections::HashMap, fmt, fs, os::unix::fs::PermissionsExt, str::FromStr, time::Duration,
@@ -49,7 +49,7 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// The five allow-listed upstream APIs.
+/// The six allow-listed upstream APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
     Sonarr,
@@ -57,20 +57,28 @@ pub enum Service {
     Lidarr,
     Tautulli,
     Jellyfin,
+    Qbittorrent,
 }
 
-/// One row per [`Service`], in declaration order: name, API root, key header.
-const SERVICES: [[&str; 3]; 5] = [
-    ["sonarr", "/api/v3", "X-Api-Key"],
-    ["radarr", "/api/v3", "X-Api-Key"],
-    ["lidarr", "/api/v1", "X-Api-Key"],
-    ["tautulli", "/api/v2", "X-Api-Key"],
-    ["jellyfin", "", "X-Emby-Token"],
+/// One row per [`Service`], in declaration order: name, API root.
+const SERVICES: [[&str; 2]; 6] = [
+    ["sonarr", "/api/v3"],
+    ["radarr", "/api/v3"],
+    ["lidarr", "/api/v1"],
+    ["tautulli", "/api/v2"],
+    ["jellyfin", ""],
+    ["qbittorrent", "/api/v2"],
 ];
 
 impl Service {
-    pub const ALL: [Self; 5] =
-        [Self::Sonarr, Self::Radarr, Self::Lidarr, Self::Tautulli, Self::Jellyfin];
+    pub const ALL: [Self; 6] = [
+        Self::Sonarr,
+        Self::Radarr,
+        Self::Lidarr,
+        Self::Tautulli,
+        Self::Jellyfin,
+        Self::Qbittorrent,
+    ];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -84,16 +92,30 @@ impl Service {
     }
 
     /// The header that carries the API key; keys never travel in URLs.
+    /// qBittorrent authenticates with a session cookie instead.
     #[must_use]
-    pub const fn key_header(self) -> &'static str {
-        SERVICES[self as usize][2]
+    pub const fn key_header(self) -> Option<&'static str> {
+        match self {
+            Self::Sonarr | Self::Radarr | Self::Lidarr | Self::Tautulli => Some("X-Api-Key"),
+            Self::Jellyfin => Some("X-Emby-Token"),
+            Self::Qbittorrent => None,
+        }
     }
+}
+
+/// How the broker authenticates to one upstream.
+#[derive(Clone, Debug)]
+pub enum Auth {
+    /// A static API key sent in the service's key header.
+    Key(Secret),
+    /// `WebUI` session credentials; the broker logs in and holds the cookie.
+    Session { username: String, password: Secret },
 }
 
 #[derive(Clone, Debug)]
 pub struct Upstream {
     pub base_url: String,
-    pub api_key: Secret,
+    pub auth: Auth,
 }
 
 /// Fully loaded settings.
@@ -101,7 +123,7 @@ pub struct Upstream {
 pub struct Settings {
     pub bearer_token: Secret,
     /// Indexed by `Service`; read through [`Settings::upstream`].
-    pub upstreams: [Upstream; 5],
+    pub upstreams: [Option<Upstream>; 6],
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub bind_host: String,
@@ -211,23 +233,51 @@ fn csv(env: &Env, name: &str, default: Option<String>, kind: Exact) -> Result<Ve
     values.iter().map(|value| exact(name, value, kind)).collect()
 }
 
-/// Load one upstream's URL and secret-file key; inline keys are forbidden.
-fn upstream(env: &Env, service: Service) -> Result<Upstream> {
+/// Load one optional upstream; a credential without a URL is an error, and
+/// inline credentials are forbidden.
+fn upstream(env: &Env, service: Service) -> Result<Option<Upstream>> {
     let prefix = service.name().to_uppercase();
+    let url_name = format!("{prefix}_URL");
+    let url = env.get(&url_name).map_or("", |value| value.trim());
+    if service == Service::Qbittorrent {
+        if env.get("QBITTORRENT_PASSWORD").is_some_and(|value| !value.is_empty()) {
+            bail!("the qBittorrent password must be set with QBITTORRENT_PASSWORD_FILE");
+        }
+        if url.is_empty() {
+            let set = |name: &str| env.get(name).is_some_and(|value| !value.trim().is_empty());
+            if set("QBITTORRENT_USERNAME") || set("QBITTORRENT_PASSWORD_FILE") {
+                bail!("QBITTORRENT_URL is required when its credentials are set");
+            }
+            return Ok(None);
+        }
+        return Ok(Some(Upstream {
+            base_url: exact(&url_name, url, Exact::Endpoint)?,
+            auth: Auth::Session {
+                username: required(env, "QBITTORRENT_USERNAME")?.to_owned(),
+                password: secret(env, "QBITTORRENT_PASSWORD_FILE")?,
+            },
+        }));
+    }
     if env.get(&format!("{prefix}_API_KEY")).is_some_and(|key| !key.is_empty()) {
         bail!("upstream API keys must be configured with *_API_KEY_FILE");
     }
-    let url = format!("{prefix}_URL");
-    Ok(Upstream {
-        base_url: exact(&url, required(env, &url)?, Exact::Endpoint)?,
-        api_key: secret(env, &format!("{prefix}_API_KEY_FILE"))?,
-    })
+    let key_file = format!("{prefix}_API_KEY_FILE");
+    if url.is_empty() {
+        if env.get(&key_file).is_some_and(|value| !value.trim().is_empty()) {
+            bail!("{url_name} is required when {key_file} is set");
+        }
+        return Ok(None);
+    }
+    Ok(Some(Upstream {
+        base_url: exact(&url_name, url, Exact::Endpoint)?,
+        auth: Auth::Key(secret(env, &key_file)?),
+    }))
 }
 
 impl Settings {
     #[must_use]
-    pub fn upstream(&self, service: Service) -> &Upstream {
-        &self.upstreams[service as usize]
+    pub fn upstream(&self, service: Service) -> Option<&Upstream> {
+        self.upstreams[service as usize].as_ref()
     }
 
     /// Load all values from the given environment and the secret files it names.
@@ -258,12 +308,16 @@ impl Settings {
             bail!("MEDIA_BROKER_TOKEN_FILE must contain 32-256 URL-safe characters");
         }
         let timeout = number(env, "MEDIA_BROKER_TIMEOUT_SECONDS", 10.0, 0.1, 60.0)?;
-        let [sonarr, radarr, lidarr, tautulli, jellyfin] =
+        let [sonarr, radarr, lidarr, tautulli, jellyfin, qbittorrent] =
             Service::ALL.map(|service| upstream(env, service));
+        let upstreams = [sonarr?, radarr?, lidarr?, tautulli?, jellyfin?, qbittorrent?];
+        if upstreams.iter().all(Option::is_none) {
+            bail!("at least one upstream must be configured");
+        }
         let origin = authority.as_ref().map(|authority| format!("http://{authority}"));
         Ok(Self {
             bearer_token,
-            upstreams: [sonarr?, radarr?, lidarr?, tautulli?, jellyfin?],
+            upstreams,
             allowed_hosts: csv(env, "MEDIA_BROKER_ALLOWED_HOSTS", authority, Exact::Host)?,
             allowed_origins: csv(env, "MEDIA_BROKER_ALLOWED_ORIGINS", origin, Exact::Origin)?,
             bind_host: bind_host.to_owned(),
