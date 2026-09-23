@@ -6,8 +6,9 @@ use std::{convert::Infallible, time::Duration};
 
 use axum::{body::Body, response::Response};
 use common::{
-    Broker, JELLYFIN_USER, Seen, assert_contains, candidate, history_reply, reply, reply_status,
-    respond, with, write_backend,
+    Broker, HASH_A, HASH_B, JELLYFIN_USER, QBIT_SID, Seen, assert_contains, candidate,
+    history_reply, qbit_backend, reply, reply_status, respond, torrent_row, with, with_qbit,
+    write_backend,
 };
 use futures_util::StreamExt as _;
 use media_broker::config::{Service, Settings};
@@ -278,7 +279,10 @@ async fn upstream_failures_are_sanitized() {
         ));
     }
     let unreachable = Broker::configured(
-        |settings| settings.upstreams[Service::Sonarr as usize].base_url = closed_port,
+        |settings| {
+            let sonarr = settings.upstreams[Service::Sonarr as usize].as_mut().unwrap();
+            sonarr.base_url = closed_port;
+        },
         reply(json!([])),
     )
     .await;
@@ -616,4 +620,169 @@ async fn album_inventory_projects_file_and_size_details() {
     let seen = broker.seen();
     assert_eq!(seen[0].path, "/api/v1/album");
     assert_eq!(seen[0].query["artistId"], "42");
+}
+
+fn torrent_broker(
+    torrents: Value,
+    stats: Value,
+    flags: (bool, bool, bool),
+) -> impl std::future::Future<Output = Broker> {
+    let (login_ok, accept_session, fail_first_get) = flags;
+    Broker::configured(
+        with_qbit,
+        qbit_backend(torrents, stats, login_ok, accept_session, fail_first_get),
+    )
+}
+
+fn logins(broker: &Broker) -> usize {
+    broker.seen().iter().filter(|request| request.path == "/api/v2/auth/login").count()
+}
+
+#[tokio::test]
+async fn torrent_stats_projects_allow_listed_fields_only() {
+    let stats = json!({
+        "connection_status": "connected", "dht_nodes": 250,
+        "dl_info_speed": 1024, "dl_info_data": 4096, "dl_rate_limit": 0,
+        "up_info_speed": 512, "up_info_data": 8192, "up_rate_limit": 100,
+        "server_state": "must not pass", "use_subcategories": "must not pass",
+    });
+    let broker = torrent_broker(json!([]), stats, (true, true, false)).await;
+    assert_eq!(
+        broker.ok("torrent_client_stats", json!({})).await,
+        json!({
+            "service": "qbittorrent", "connection_status": "connected", "dht_nodes": 250,
+            "download_speed_bytes": 1024, "downloaded_bytes": 4096, "download_rate_limit_bytes": 0,
+            "upload_speed_bytes": 512, "uploaded_bytes": 8192, "upload_rate_limit_bytes": 100,
+        })
+    );
+    let seen = broker.seen();
+    assert_eq!(logins(&broker), 1, "{seen:?}");
+    let stats_call = seen.iter().find(|request| request.path == "/api/v2/transfer/info").unwrap();
+    assert_eq!(stats_call.header("cookie"), Some(format!("SID={QBIT_SID}").as_str()));
+    assert!(!stats_call.target.contains("secret"), "{}", stats_call.target);
+}
+
+#[tokio::test]
+async fn torrent_inventory_projects_searches_and_paginates_locally() {
+    let other =
+        with(torrent_row(), json!({"hash": HASH_B, "name": "Another.Pack", "progress": 0.5}));
+    let broker =
+        torrent_broker(json!([torrent_row(), other]), json!({}), (true, true, false)).await;
+    let first = broker.ok("torrent_client_inventory", json!({"page_size": 1})).await;
+    let expected = json!({
+        "hash": HASH_A, "name": "Example.Release.2024", "state": "stoppedUP",
+        "size_bytes": 4_700_000_000_i64, "progress": 1.0, "ratio": 2.5,
+        "seeding_time_seconds": 864_000, "save_path": "/mnt/data/torrents",
+        "added_on": 1_700_000_000, "amount_left_bytes": 0,
+    });
+    assert_eq!(first["items"][0], expected);
+    assert_eq!(
+        first["pagination"],
+        json!({"page": 1, "page_size": 1, "returned_count": 1, "total_count": 2,
+               "has_more": true, "upstream_paginated": false, "upstream_truncated": false})
+    );
+    let searched = broker.ok("torrent_client_inventory", json!({"search": "another"})).await;
+    assert_eq!(searched["items"].as_array().unwrap().len(), 1);
+    assert_eq!(searched["items"][0]["hash"], HASH_B);
+    assert_eq!(searched["pagination"]["total_count"], 1);
+    // The upstream is queried once and filtered locally, never by name.
+    let seen = broker.seen();
+    let mut infos = seen.iter().filter(|request| request.path == "/api/v2/torrents/info");
+    assert!(infos.all(|request| request.query.is_empty()), "{seen:?}");
+    // The session is established once and reused across both calls.
+    assert_eq!(logins(&broker), 1, "{:?}", broker.seen());
+}
+
+#[tokio::test]
+async fn torrent_inventory_rejects_wrong_typed_fields() {
+    let wrong = json!([{
+        "hash": 1, "name": true, "state": [], "size": "x", "progress": "x", "ratio": "x",
+        "seeding_time": "x", "save_path": 1, "added_on": "x", "amount_left": "x",
+    }]);
+    let broker = torrent_broker(wrong, json!({}), (true, true, false)).await;
+    let result = broker.ok("torrent_client_inventory", json!({})).await;
+    assert_eq!(
+        result["items"][0],
+        json!({
+            "hash": null, "name": null, "state": null, "size_bytes": null, "progress": null,
+            "ratio": null, "seeding_time_seconds": null, "save_path": null, "added_on": null,
+            "amount_left_bytes": null,
+        })
+    );
+}
+
+#[tokio::test]
+async fn torrent_check_paths_reports_presence_and_dedupes_hashes() {
+    let broker = torrent_broker(json!([torrent_row()]), json!({}), (true, true, false)).await;
+    let upper = HASH_A.to_uppercase();
+    let arguments = json!({"hashes": [HASH_A, upper, HASH_B, HASH_A]});
+    let result = broker.ok("torrent_client_check_paths", arguments).await;
+    assert_eq!(
+        result,
+        json!({
+            "service": "qbittorrent", "requested_count": 2, "found_count": 1,
+            "items": [
+                {"hash": HASH_A, "present": true, "name": "Example.Release.2024",
+                 "state": "stoppedUP", "progress": 1.0, "amount_left_bytes": 0,
+                 "save_path": "/mnt/data/torrents", "data_complete": true},
+                {"hash": HASH_B, "present": false},
+            ],
+        })
+    );
+    let seen = broker.seen();
+    let info = seen.iter().find(|request| request.path == "/api/v2/torrents/info").unwrap();
+    assert_eq!(info.query["hashes"], format!("{HASH_A}|{HASH_B}"));
+}
+
+#[tokio::test]
+async fn torrent_check_paths_validates_hashes_before_any_upstream_call() {
+    let broker = torrent_broker(json!([]), json!({}), (true, true, false)).await;
+    let not_hex = "g".repeat(64);
+    for hashes in [json!(["not-a-hash"]), json!([not_hex]), json!([HASH_A, "x"])] {
+        let error = broker.err("torrent_client_check_paths", json!({"hashes": hashes})).await;
+        assert!(error.contains("40 or 64 hexadecimal"), "{hashes}: {error}");
+    }
+    assert!(broker.seen().is_empty(), "{:?}", broker.seen());
+}
+
+#[tokio::test]
+async fn torrent_session_recovers_once_from_a_rejected_cookie() {
+    let broker = torrent_broker(json!([torrent_row()]), json!({}), (true, true, true)).await;
+    let result = broker.ok("torrent_client_inventory", json!({})).await;
+    assert_eq!(result["items"][0]["hash"], HASH_A);
+    assert_eq!(logins(&broker), 2, "{:?}", broker.seen());
+}
+
+#[tokio::test]
+async fn torrent_session_failures_are_sanitized() {
+    // A session that stays rejected is reported once, not retried forever.
+    let rejected = torrent_broker(json!([]), json!({}), (true, false, false)).await;
+    let error = rejected.err("torrent_client_stats", json!({})).await;
+    assert!(error.contains("HTTP 403"), "{error}");
+    assert!(!error.contains("secret"), "{error}");
+    assert_eq!(logins(&rejected), 2, "{:?}", rejected.seen());
+    // A refused login surfaces as an authentication failure without the password.
+    let refused = torrent_broker(json!([]), json!({}), (false, true, false)).await;
+    let error = refused.err("torrent_client_stats", json!({})).await;
+    assert!(error.contains("authentication failed"), "{error}");
+    assert!(!error.contains("secret"), "{error}");
+    assert_eq!(logins(&refused), 1, "{:?}", refused.seen());
+}
+
+#[tokio::test]
+async fn tools_for_unconfigured_upstreams_are_clear_parameter_errors() {
+    // Radarr stays configured so the arr gate keeps the tools registered;
+    // addressing a removed service must fail before any upstream call.
+    let broker = Broker::configured(
+        |settings| {
+            settings.upstreams[Service::Sonarr as usize] = None;
+            settings.upstreams[Service::Lidarr as usize] = None;
+        },
+        reply(json!([])),
+    )
+    .await;
+    let error = broker.err("arr_library_inventory", json!({"service": "sonarr"})).await;
+    assert!(error.contains("sonarr is not configured"), "{error}");
+    assert!(!error.contains(".test"), "{error}");
+    assert!(broker.seen().is_empty(), "{:?}", broker.seen());
 }

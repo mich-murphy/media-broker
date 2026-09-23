@@ -8,10 +8,12 @@ repository; see its `docs/hermes-media.md` for the deployment runbook.
 
 This project exposes a small MCP server over the official Rust SDK's (`rmcp`)
 Streamable HTTP transport. The adapters target Sonarr 4.0.19 (API v3), Radarr
-6.3.0 (API v3), Lidarr 3.1.0 (API v1), Tautulli 2.18.1, and the Jellyfin
-Playback Reporting plugin (v19).
+6.3.0 (API v3), Lidarr 3.1.0 (API v1), Tautulli 2.18.1, the Jellyfin
+Playback Reporting plugin (v19), and qBittorrent 5.1 (WebUI API v2).
 
-Read tools, always available:
+Read tools, available when the relevant upstream is configured (at least one
+upstream must be configured; each Arr tool needs any Arr service,
+`arr_season_inventory` needs Sonarr, and `arr_album_inventory` needs Lidarr):
 
 - `arr_library_inventory` (Sonarr, Radarr, or Lidarr; bounded local pagination; includes the added date, genres, size on disk, and file counts for cleanup audits; Sonarr items also list per-season monitored flags)
 - `arr_quality_profiles`
@@ -22,6 +24,18 @@ Read tools, always available:
 - `tautulli_play_history` (movie, episode, or track; inclusive maximum 31-day range and optional numeric user filter)
 - `jellyfin_play_history` (movie, episode, or track; inclusive maximum 31-day range, exact 32-hex-character user id, and local pagination)
 - `jellyfin_users` (id/name pairs from `GET /Users`, so `jellyfin_play_history` user ids are discoverable without dashboard access)
+
+qBittorrent read tools, registered when `QBITTORRENT_URL` is configured:
+
+- `torrent_client_stats` (global transfer totals, current speeds, and connection status)
+- `torrent_client_inventory` (bounded local pagination over torrent swarm state, including save paths)
+- `torrent_client_check_paths` (which 40- or 64-hex-character info-hashes are present, with save paths and recorded data completeness, for reseed-candidate audits)
+
+`data_complete` reports the client's recorded progress; verifying bytes on
+disk requires a recheck, which is a write and out of scope. There is no
+torrent add, delete, or settings mutation, and no generic request path: the
+qBittorrent adapter speaks only `auth/login`, `torrents/info`, and
+`transfer/info`.
 
 Write tools, registered only when enabled:
 
@@ -99,6 +113,9 @@ export TAUTULLI_URL=http://127.0.0.1:8181
 export TAUTULLI_API_KEY_FILE=/run/user/1000/media-broker/tautulli
 export JELLYFIN_URL=http://127.0.0.1:8096
 export JELLYFIN_API_KEY_FILE=/run/user/1000/media-broker/jellyfin
+export QBITTORRENT_URL=http://127.0.0.1:8080
+export QBITTORRENT_USERNAME=admin
+export QBITTORRENT_PASSWORD_FILE=/run/user/1000/media-broker/qbittorrent
 export MEDIA_BROKER_ALLOWED_HOSTS=127.0.0.1:8000
 export MEDIA_BROKER_ALLOWED_ORIGINS=http://127.0.0.1:8000
 cargo run --release
@@ -106,8 +123,12 @@ cargo run --release
 
 `nix develop` (or direnv) provides the Rust toolchain.
 
-All five upstreams and all secret files are required, and a secret file that is
-world-readable is refused at startup. The broker defaults to loopback binding,
+Upstreams are optional, but at least one must be configured. An upstream is
+enabled by its `*_URL` plus its credentials: `*_API_KEY_FILE` for the Arr
+services, Tautulli, and Jellyfin, or `QBITTORRENT_USERNAME` and
+`QBITTORRENT_PASSWORD_FILE` for qBittorrent. Credentials without their URL
+fail at startup, and a secret file that is world-readable is refused. The
+broker defaults to loopback binding,
 HTTPS certificate verification, no redirects, a 10-second total upstream
 deadline (`MEDIA_BROKER_TIMEOUT_SECONDS`, 0.1-60), and a 2 MB upstream response
 limit (`MEDIA_BROKER_MAX_RESPONSE_BYTES`, 1000-50000000). Host and Origin values
@@ -115,7 +136,11 @@ are exact allow-lists; wildcard syntax is rejected. Tautulli requests
 use its inclusive `after`/`before` date bounds with `grouping=0` and
 `include_activity=0` so each returned row represents a playback event.
 Arr and Tautulli use `X-Api-Key` header authentication; Jellyfin uses its
-`X-Emby-Token` header. The broker never includes credentials in query URLs.
+`X-Emby-Token` header. qBittorrent uses `WebUI` session authentication: the
+broker logs in once, holds the session cookie in memory (never in URLs, logs,
+or tool responses), and re-authenticates exactly once if a request is
+rejected, because repeated logins can trigger qBittorrent's IP ban. The
+broker never includes credentials in query URLs.
 Jellyfin Playback Reporting history requests one allow-listed `GetItems` route
 per day with a requested `Movie`, `Episode`, or `Audio` filter and timezone
 offset. Results are projected to the requested user and local date/time; no
@@ -152,7 +177,8 @@ timezone offsets from -14 to 14 hours, external ids up to 64 characters, item,
 profile, and album ids within int32, season selections of 1-100 season numbers
 between 0 and 1000, candidate lists of at most 100, confirmation tokens up to
 128 characters) are declared in
-each tool's input schema, so clients see them before calling. Rejected
+each tool's input schema, so clients see them before calling. Torrent hash
+lists hold 1-100 entries of up to 64 characters each. Rejected
 arguments and upstream failures are reported through the MCP `isError` result
 with a sanitized message naming the offending argument; every tool error is one
 of those two typed kinds, so upstream bodies, URLs, and keys never reach the
@@ -182,7 +208,11 @@ The image is private to the `mich-murphy` account. Its runtime stage contains
 only the binary on a distroless base (no shell, toolchain, or source tree),
 runs as UID/GID 65532 with a read-only filesystem, listens on container port
 8000, and expects all credentials as file paths (`*_FILE` variables), never
-values.
+values. The image declares a `HEALTHCHECK` that runs the binary's own
+`--healthcheck` probe (the distroless runtime has no shell or curl) against
+the unauthenticated `GET /health` route, which answers only that exact method
+and path with a static `{"status": "ok"}`; every other method and path still
+requires the bearer token.
 
 `tests/container.sh` performs an isolated local build-and-probe against fake
 upstreams using the `desktop-linux` Docker context; it creates and removes

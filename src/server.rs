@@ -5,7 +5,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use axum::{
     Router,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -29,7 +29,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     adapters::{ArrService, Error, MediaClient, MediaType},
-    config::{Secret, Settings},
+    config::{Secret, Service, Settings},
 };
 
 // Argument bounds live in the types, so invalid input is unrepresentable and
@@ -65,6 +65,11 @@ struct Offset(f64);
 #[derive(Debug, Deserialize)]
 #[serde(try_from = "Vec<Int<0, 1000>>")]
 struct Seasons(Vec<u32>);
+
+/// A list of 1 to 100 torrent info-hashes.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "Vec<Text<1, 64>>")]
+struct Hashes(Vec<String>);
 
 /// Bound one argument newtype: `$checked` turns the wire value into the inner
 /// value or `None`, `$schema` publishes the same bounds inline, and `Deref`
@@ -128,6 +133,12 @@ argument!([] Seasons: Vec<Int<0, 1000>> => [u32],
     |seasons| (1..=100).contains(&seasons.len())
         .then(|| seasons.iter().map(|season| season.0).collect()),
     "must contain between 1 and 100 seasons");
+argument!([] Hashes: Vec<Text<1, 64>> => [String],
+    {"type": "array", "minItems": 1, "maxItems": 100,
+     "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+    |hashes| (1..=100).contains(&hashes.len())
+        .then(|| hashes.iter().map(|hash| hash.0.clone()).collect()),
+    "must contain between 1 and 100 hashes");
 
 type Page = Int<1, 100_000, 1>;
 type PageSize = Int<1, 100, 50>;
@@ -154,8 +165,9 @@ const fn yes() -> bool {
 
 /// The whole tool surface: a variant's name is the tool name, its doc comment
 /// the description, its fields the arguments, and `access` its annotations and
-/// gate (`read` is always on, `write` and `toggle` need requests, `delete`
-/// needs deletes).
+/// gate (`arr`/`sonarr`/`lidarr`/`jellyfin`/`tautulli`/`qbittorrent` need that
+/// upstream configured, `write` and `toggle` need requests, `delete` needs
+/// deletes).
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 // Doc comments are the verbatim tool descriptions; a one-value `service`
@@ -163,7 +175,7 @@ const fn yes() -> bool {
 #[allow(clippy::doc_markdown, dead_code)]
 enum ToolCall {
     /// Return a bounded page of Sonarr, Radarr, or Lidarr library inventory.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "arr"))]
     ArrLibraryInventory {
         service: ArrService,
         #[serde(default)]
@@ -173,13 +185,13 @@ enum ToolCall {
         search: Option<Search>,
     },
     /// Return projected quality-profile summaries for one Arr service.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "arr"))]
     ArrQualityProfiles { service: ArrService },
     /// Return projected root-folder summaries for one Arr service.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "arr"))]
     ArrRootFolders { service: ArrService },
     /// Search one Arr catalog for requestable media by title or keyword.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "arr"))]
     ArrSearchCandidates {
         service: ArrService,
         query: Text<1, 200>,
@@ -187,10 +199,10 @@ enum ToolCall {
         limit: Limit,
     },
     /// List Jellyfin users as id/name pairs for jellyfin_play_history.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "jellyfin"))]
     JellyfinUsers {},
     /// Return sanitized Playback Reporting history over at most 31 days.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "jellyfin"))]
     JellyfinPlayHistory {
         user_id: JellyfinUserId,
         media_type: MediaType,
@@ -204,7 +216,7 @@ enum ToolCall {
         timezone_offset: Offset,
     },
     /// Return sanitized playback history for one media type over at most 31 days.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "tautulli"))]
     TautulliPlayHistory {
         media_type: MediaType,
         start_date: Date,
@@ -216,11 +228,29 @@ enum ToolCall {
         user_id: Option<UserId>,
     },
     /// Return per-season monitoring and episode file counts for one series.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "sonarr"))]
     ArrSeasonInventory { service: SonarrOnly, item_id: Id },
     /// Return per-album monitoring, file, and size details for one artist.
-    #[schemars(extend("access" = "read"))]
+    #[schemars(extend("access" = "lidarr"))]
     ArrAlbumInventory { service: LidarrOnly, artist_id: Id },
+    /// Return qBittorrent transfer totals, speeds, and connection status.
+    #[schemars(extend("access" = "qbittorrent"))]
+    TorrentClientStats {},
+    /// Return a bounded page of torrents with swarm state and save paths.
+    #[schemars(extend("access" = "qbittorrent"))]
+    TorrentClientInventory {
+        #[serde(default)]
+        page: Page,
+        #[serde(default)]
+        page_size: PageSize,
+        search: Option<Search>,
+    },
+    /// Report which info-hashes are present with complete recorded data.
+    ///
+    /// Completeness reflects the client's recorded progress; verifying bytes
+    /// on disk requires a recheck, which is a write and out of scope.
+    #[schemars(extend("access" = "qbittorrent"))]
+    TorrentClientCheckPaths { hashes: Hashes },
     /// Add one exact catalog item; searching for downloads is the default.
     ///
     /// Sonarr accepts an optional seasons list so only those seasons are
@@ -286,6 +316,10 @@ impl ToolCall {
                 client.history(media_type, start_date, end_date, *page, *page_size, user_id.as_deref().copied()).await,
             Self::ArrSeasonInventory { item_id, .. } => client.season_inventory(*item_id).await,
             Self::ArrAlbumInventory { artist_id, .. } => client.album_inventory(*artist_id).await,
+            Self::TorrentClientStats {} => client.torrent_stats().await,
+            Self::TorrentClientInventory { page, page_size, search } =>
+                client.torrent_inventory(*page, *page_size, search.as_deref()).await,
+            Self::TorrentClientCheckPaths { hashes } => client.torrent_check_paths(&hashes).await,
             Self::ArrRequestMedia { service, external_id, quality_profile_id, root_folder_path, search_on_add, seasons } =>
                 client.request_media(service, &external_id, *quality_profile_id, &root_folder_path, search_on_add,
                     seasons.as_deref()).await,
@@ -312,14 +346,22 @@ fn tools(settings: &Settings) -> Vec<Tool> {
         SchemaSettings::draft2020_12().with(|settings| settings.inline_subschemas = true);
     let schema = generator.into_generator().into_root_schema_for::<ToolCall>().to_value();
     let variants = schema["oneOf"].as_array().expect("one schema per tool");
+    let configured = |service: Service| settings.upstream(service).is_some();
+    let arr =
+        configured(Service::Sonarr) || configured(Service::Radarr) || configured(Service::Lidarr);
     let tool = |variant: &Value| {
         let (name, input) = variant["properties"].as_object()?.iter().next()?;
         // (enabled, read-only, destructive, idempotent)
         let (enabled, read_only, destructive, idempotent) = match variant["access"].as_str() {
-            Some("read") => (true, true, false, true),
-            Some("write") => (settings.enable_requests, false, false, false),
-            Some("toggle") => (settings.enable_requests, false, false, true),
-            Some("delete") => (settings.enable_deletes, false, true, false),
+            Some("arr") => (arr, true, false, true),
+            Some("sonarr") => (configured(Service::Sonarr), true, false, true),
+            Some("lidarr") => (configured(Service::Lidarr), true, false, true),
+            Some("jellyfin") => (configured(Service::Jellyfin), true, false, true),
+            Some("tautulli") => (configured(Service::Tautulli), true, false, true),
+            Some("qbittorrent") => (configured(Service::Qbittorrent), true, false, true),
+            Some("write") => (arr && settings.enable_requests, false, false, false),
+            Some("toggle") => (arr && settings.enable_requests, false, false, true),
+            Some("delete") => (arr && settings.enable_deletes, false, true, false),
             access => panic!("tool {name} has no known access level: {access:?}"),
         };
         let hints = [read_only, destructive, idempotent, false].map(Some);
@@ -384,6 +426,20 @@ impl ServerHandler for Broker {
     }
 }
 
+/// Answer unauthenticated liveness probes with a static, data-free body.
+///
+/// Container health checks carry no credentials, so this one exact route runs
+/// ahead of the bearer boundary. It returns nothing but liveness and never
+/// touches an upstream.
+async fn health(request: Request, next: Next) -> Response {
+    if request.method() == Method::GET && request.uri().path() == "/health" {
+        let headers =
+            [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")];
+        return (StatusCode::OK, headers, json!({"status": "ok"}).to_string()).into_response();
+    }
+    next.run(request).await
+}
+
 /// Require exactly one valid bearer on every HTTP route, including unknown paths.
 async fn bearer(State(token): State<Arc<Secret>>, request: Request, next: Next) -> Response {
     let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
@@ -425,7 +481,10 @@ pub fn router(settings: Settings) -> Router {
         Arc::new(LocalSessionManager::default()),
         config,
     );
+    // The health layer runs outermost so its one exact route answers ahead of
+    // the bearer boundary; every other method and path falls through to it.
     Router::new()
         .route_service("/mcp", service)
         .layer(middleware::from_fn_with_state(token, bearer))
+        .layer(middleware::from_fn(health))
 }
