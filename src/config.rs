@@ -1,8 +1,10 @@
 //! Configuration and secret-file handling for the media broker.
 //!
 //! Write tools are opt-in: requests enable brokered adds, monitoring changes,
-//! and search triggers, while deletes enable the two-phase destructive media
-//! removal tool. Every upstream is optional, but at least one must be set.
+//! and search triggers, deletes enable the two-phase destructive media
+//! removal tool, and reseeds enable the verified-complete qBittorrent reseed
+//! into allow-listed save paths. Every upstream is optional, but at least one
+//! must be set.
 
 use std::{
     collections::HashMap, fmt, fs, os::unix::fs::PermissionsExt, str::FromStr, time::Duration,
@@ -133,8 +135,16 @@ pub struct Settings {
     pub max_response_bytes: usize,
     pub enable_requests: bool,
     pub enable_deletes: bool,
+    pub enable_reseeds: bool,
+    /// Exact qBittorrent save paths a reseed may target; empty unless enabled.
+    pub reseed_save_paths: Vec<String>,
     /// Lifetime of a delete confirmation.
     pub confirmation_ttl: Duration,
+    /// How often a reseed polls qBittorrent while a recheck runs.
+    pub reseed_poll_interval: Duration,
+    /// Total time one reseed call may wait for the torrent and its recheck;
+    /// a longer check reports `checking` and resumes on replay.
+    pub reseed_deadline: Duration,
 }
 
 type Env = HashMap<String, String>;
@@ -233,6 +243,34 @@ fn csv(env: &Env, name: &str, default: Option<String>, kind: Exact) -> Result<Ve
     values.iter().map(|value| exact(name, value, kind)).collect()
 }
 
+/// Exact absolute directories without dot segments, wildcards, or control
+/// characters; the filesystem root is refused because it allows everything.
+fn save_paths(env: &Env, enabled: bool) -> Result<Vec<String>> {
+    const NAME: &str = "QBITTORRENT_RESEED_SAVE_PATHS";
+    let raw = env.get(NAME).map_or("", |raw| raw.trim());
+    if !enabled {
+        if !raw.is_empty() {
+            bail!("{NAME} requires MEDIA_BROKER_ENABLE_RESEEDS=true");
+        }
+        return Ok(Vec::new());
+    }
+    let paths: Vec<&str> = raw.split(',').map(str::trim).filter(|path| !path.is_empty()).collect();
+    if paths.is_empty() {
+        bail!("{NAME} must contain at least one value when reseeds are enabled");
+    }
+    let exact_path = |path: &&str| {
+        let segments = path.trim_end_matches('/').split('/').skip(1);
+        path.starts_with('/')
+            && path.trim_end_matches('/').len() > 1
+            && !path.contains(|character: char| character == '*' || character.is_control())
+            && segments.clone().all(|segment| !matches!(segment, "" | "." | ".."))
+    };
+    if let Some(path) = paths.iter().find(|path| !exact_path(path)) {
+        bail!("invalid {NAME}: {path} is not an exact absolute directory");
+    }
+    Ok(paths.iter().map(|path| path.trim_end_matches('/').to_owned()).collect())
+}
+
 /// Load one optional upstream; a credential without a URL is an error, and
 /// inline credentials are forbidden.
 fn upstream(env: &Env, service: Service) -> Result<Option<Upstream>> {
@@ -315,6 +353,10 @@ impl Settings {
             bail!("at least one upstream must be configured");
         }
         let origin = authority.as_ref().map(|authority| format!("http://{authority}"));
+        let enable_reseeds = flag(env, "MEDIA_BROKER_ENABLE_RESEEDS")?;
+        if enable_reseeds && upstreams[Service::Qbittorrent as usize].is_none() {
+            bail!("MEDIA_BROKER_ENABLE_RESEEDS=true requires QBITTORRENT_URL");
+        }
         Ok(Self {
             bearer_token,
             upstreams,
@@ -332,7 +374,11 @@ impl Settings {
             )?,
             enable_requests: flag(env, "MEDIA_BROKER_ENABLE_REQUESTS")?,
             enable_deletes: flag(env, "MEDIA_BROKER_ENABLE_DELETES")?,
+            enable_reseeds,
+            reseed_save_paths: save_paths(env, enable_reseeds)?,
             confirmation_ttl: Duration::from_secs(300),
+            reseed_poll_interval: Duration::from_secs(1),
+            reseed_deadline: Duration::from_secs(45),
         })
     }
 }

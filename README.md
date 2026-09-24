@@ -32,10 +32,12 @@ qBittorrent read tools, registered when `QBITTORRENT_URL` is configured:
 - `torrent_client_check_paths` (which 40- or 64-hex-character info-hashes are present, with save paths and recorded data completeness, for reseed-candidate audits)
 
 `data_complete` reports the client's recorded progress; verifying bytes on
-disk requires a recheck, which is a write and out of scope. There is no
-torrent add, delete, or settings mutation, and no generic request path: the
-qBittorrent adapter speaks only `auth/login`, `torrents/info`, and
-`transfer/info`.
+disk requires a recheck, which only the gated reseed tool performs. There is
+no generic torrent add, start, or delete, no settings mutation, and no generic
+request path: the read tools speak only `auth/login`, `torrents/info`, and
+`transfer/info`, and the reseed tool adds `app/preferences` (read) and
+`torrents/add`, `torrents/recheck`, `torrents/start`, and `torrents/delete`
+for the one torrent it is driving.
 
 Write tools, registered only when enabled:
 
@@ -44,6 +46,8 @@ Write tools, registered only when enabled:
   behind `MEDIA_BROKER_ENABLE_REQUESTS=true`
 - `arr_delete_media` (whole items and, for Lidarr, single albums) behind
   `MEDIA_BROKER_ENABLE_DELETES=true`
+- `torrent_client_reseed` behind `MEDIA_BROKER_ENABLE_RESEEDS=true`, which
+  requires qBittorrent and `QBITTORRENT_RESEED_SAVE_PATHS`
 
 There are no generic upstream requests, approval endpoints, Seerr, or Jellyfin
 core endpoints. Arr APIs return arrays, so inventory pagination is performed
@@ -95,6 +99,55 @@ album and the artist so the caller can verify the target. `delete_files=false`
 removes files too. Import-list exclusions are never added, so exclusion lists
 are managed by the operator, not the broker.
 
+## Torrent reseeds
+
+`torrent_client_reseed` re-adds one `.torrent` file over data already on disk
+and starts seeding only if a full recheck verifies every piece. The file comes
+as base64, holds v1 metainfo only, and decodes to at most 1 MiB. The broker
+computes the info-hash itself and only ever addresses that one torrent, so the
+tool cannot be used as a generic add.
+
+1. A hash already in the client that this tool did not add is left alone and
+   reported as `already_present`.
+2. Anything else is added stopped with `skip_checking=false`, the tag
+   `media-broker-reseed`, and a 1 B/s download limit. The add also sends
+   `autoTMM=false`, `useDownloadPath=false`, `contentLayout=Original`, and an
+   explicit `savepath`, which overrides every client default that could move
+   or reshape the files. qBittorrent loads the torrent asynchronously, so the
+   broker waits for it to be listed and then forces a recheck.
+3. If every piece of every file verifies, the broker starts the torrent and
+   reports `reseeding`. Otherwise it removes the torrent with
+   `deleteFiles=false` and reports `aborted_incomplete` with the recorded
+   progress, so the operator can look for renamed, moved, missing, or
+   retagged data.
+4. A recheck still running after 45 seconds reports `checking`. Replaying the
+   same call finds the tagged torrent and picks up where it stopped. It polls
+   a running check, starts a stopped torrent that already verified complete,
+   and rechecks one that did not. A batch interrupted anywhere, including by a
+   client disconnect, can be re-run in full. The broker runs one reseed at a
+   time.
+
+`save_path` must exactly match an entry in `QBITTORRENT_RESEED_SAVE_PATHS`, a
+comma-separated list of absolute directories. The filesystem root and dot
+segments are refused. With a single entry, `save_path` may be omitted. Each
+result carries `hash`, `outcome`, `name`, `state`, `progress`, `size_bytes`,
+`amount_left_bytes`, and `save_path`.
+
+No payload block is downloaded. When the files are on disk, qBittorrent pauses
+the torrent the moment hashing ends, before any announce. When none of them
+are, libtorrent skips hashing and can briefly resume the auto-managed torrent
+before qBittorrent stops it again. The 1 B/s limit keeps any block from
+completing in that window, and the broker removes a torrent it sees running
+incomplete straight away.
+
+Two client settings would let an incomplete recheck change files on disk, so
+the broker reads the preferences first and refuses to reseed under either. One
+is the extension qBittorrent appends to incomplete files, which would rename
+them. The other is excluded file names combined with the unwanted folder,
+which would move them. Excluded file names on their own only shrink the wanted
+size, and a torrent with any file excluded never counts as complete. A
+reseeded torrent keeps its tag and its 1 B/s limit as a reseed-only marker.
+
 ## Local run
 
 Create one file for the broker bearer token and one file for each upstream API
@@ -116,6 +169,9 @@ export JELLYFIN_API_KEY_FILE=/run/user/1000/media-broker/jellyfin
 export QBITTORRENT_URL=http://127.0.0.1:8080
 export QBITTORRENT_USERNAME=admin
 export QBITTORRENT_PASSWORD_FILE=/run/user/1000/media-broker/qbittorrent
+# Optional: enable torrent_client_reseed into exact save paths.
+export MEDIA_BROKER_ENABLE_RESEEDS=true
+export QBITTORRENT_RESEED_SAVE_PATHS=/data/torrents/music
 export MEDIA_BROKER_ALLOWED_HOSTS=127.0.0.1:8000
 export MEDIA_BROKER_ALLOWED_ORIGINS=http://127.0.0.1:8000
 cargo run --release
@@ -178,7 +234,8 @@ profile, and album ids within int32, season selections of 1-100 season numbers
 between 0 and 1000, candidate lists of at most 100, confirmation tokens up to
 128 characters) are declared in
 each tool's input schema, so clients see them before calling. Torrent hash
-lists hold 1-100 entries of up to 64 characters each. Rejected
+lists hold 1-100 entries of up to 64 characters each, and reseed metainfo is
+at most 1398104 base64 characters (1 MiB decoded). Rejected
 arguments and upstream failures are reported through the MCP `isError` result
 with a sanitized message naming the offending argument; every tool error is one
 of those two typed kinds, so upstream bodies, URLs, and keys never reach the
@@ -221,7 +278,11 @@ every resource it uses.
 MCP authentication proves possession of the configured bearer token, not human
 consent or authorization for a particular media action. The default surface
 is read-only; enabling the write gates extends that single credential to
-media requests and, with the delete gate, confirmed destructive removal.
+media requests, with the delete gate to confirmed destructive removal, and
+with the reseed gate to seeding verified data from the allow-listed save
+paths. A reseeded torrent announces to the trackers named in the supplied
+metainfo, so a token holder can make qBittorrent announce to a tracker of
+their choosing for data that already verifies on disk.
 Upstream credentials and playback titles remain sensitive household data;
 keep the broker on a trusted loopback or private network, review client
 access, and enable the write gates only where clients are expected to mutate

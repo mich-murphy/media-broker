@@ -2,9 +2,10 @@
 
 media-broker is an authenticated boundary between an AI agent and household
 media services, so vulnerability reports are welcome. Its read tools are
-registered when their upstream is configured; media-request and delete tools
-are registered only when explicitly enabled, and deletes additionally require
-a parameter-bound confirmation token.
+registered when their upstream is configured; media-request, delete, and
+torrent-reseed tools are registered only when explicitly enabled, deletes
+additionally require a parameter-bound confirmation token, and reseeds start
+only torrents whose data a full recheck verified.
 
 ## Reporting
 
@@ -21,7 +22,9 @@ In scope: authentication bypass, Host or Origin allow-list bypass, leakage of
 upstream credentials (API keys or the qBittorrent session cookie) or
 unprojected upstream data, delete-confirmation forgery
 or replay outside its expiry, write tools reachable without their documented
-enable flag, and any way to make the broker perform an unbounded upstream
+enable flag, a reseed that downloads payload, starts an unverified torrent,
+targets a save path outside its allow-list, or modifies a torrent it did not
+add, and any way to make the broker perform an unbounded upstream
 request.
 
 Out of scope: the security of the upstream services themselves, and

@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    adapters::{ArrService, Error, MediaClient, MediaType},
+    adapters::{ArrService, Error, MAX_TORRENT_BYTES, MediaClient, MediaType},
     config::{Secret, Service, Settings},
 };
 
@@ -146,6 +146,8 @@ type Limit = Int<1, 100, 10>;
 type Id = Int<1, { i32::MAX as u32 }>;
 type UserId = Int<0, { i32::MAX as u32 }>;
 type Search = Text<0, 200>;
+/// Base64 of at most [`MAX_TORRENT_BYTES`] bytes: four characters per three.
+type TorrentB64 = Text<1, { MAX_TORRENT_BYTES.div_ceil(3) * 4 }>;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -167,7 +169,7 @@ const fn yes() -> bool {
 /// the description, its fields the arguments, and `access` its annotations and
 /// gate (`arr`/`sonarr`/`lidarr`/`jellyfin`/`tautulli`/`qbittorrent` need that
 /// upstream configured, `write` and `toggle` need requests, `delete` needs
-/// deletes).
+/// deletes, `reseed` needs qBittorrent and reseeds).
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 // Doc comments are the verbatim tool descriptions; a one-value `service`
@@ -251,6 +253,17 @@ enum ToolCall {
     /// on disk requires a recheck, which is a write and out of scope.
     #[schemars(extend("access" = "qbittorrent"))]
     TorrentClientCheckPaths { hashes: Hashes },
+    /// Reseed one .torrent over data on disk; seeds only after a full recheck.
+    ///
+    /// Adds the base64 metainfo stopped and tagged into an allow-listed
+    /// save_path (optional when only one is allowed), rechecks, and starts it
+    /// only when every piece verifies (outcome reseeding); otherwise removes
+    /// it keeping the data (aborted_incomplete). A torrent already in the
+    /// client and not added by this tool is untouched (already_present). A
+    /// recheck that outlasts the call reports checking; replaying the same
+    /// call resumes it, so a whole batch is safe to re-run.
+    #[schemars(extend("access" = "reseed"))]
+    TorrentClientReseed { torrent_b64: TorrentB64, save_path: Option<Text<1, 1024>> },
     /// Add one exact catalog item; searching for downloads is the default.
     ///
     /// Sonarr accepts an optional seasons list so only those seasons are
@@ -320,6 +333,8 @@ impl ToolCall {
             Self::TorrentClientInventory { page, page_size, search } =>
                 client.torrent_inventory(*page, *page_size, search.as_deref()).await,
             Self::TorrentClientCheckPaths { hashes } => client.torrent_check_paths(&hashes).await,
+            Self::TorrentClientReseed { torrent_b64, save_path } =>
+                client.torrent_reseed(&torrent_b64, save_path.as_deref()).await,
             Self::ArrRequestMedia { service, external_id, quality_profile_id, root_folder_path, search_on_add, seasons } =>
                 client.request_media(service, &external_id, *quality_profile_id, &root_folder_path, search_on_add,
                     seasons.as_deref()).await,
@@ -362,6 +377,9 @@ fn tools(settings: &Settings) -> Vec<Tool> {
             Some("write") => (arr && settings.enable_requests, false, false, false),
             Some("toggle") => (arr && settings.enable_requests, false, false, true),
             Some("delete") => (arr && settings.enable_deletes, false, true, false),
+            Some("reseed") => {
+                (configured(Service::Qbittorrent) && settings.enable_reseeds, false, false, true)
+            }
             access => panic!("tool {name} has no known access level: {access:?}"),
         };
         let hints = [read_only, destructive, idempotent, false].map(Some);
@@ -385,8 +403,9 @@ impl ServerHandler for Broker {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("media-broker", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Projected media inventory and playback history; media requests and \
-                 library cleanup are available only where explicitly enabled.",
+                "Projected media inventory and playback history; media requests, \
+                 library cleanup, and verified torrent reseeds are available only where \
+                 explicitly enabled.",
             )
     }
 
