@@ -254,3 +254,27 @@ fn write_gates_default_to_disabled_and_need_an_explicit_boolean() {
         "ENABLE_DELETES must be true or false",
     );
 }
+
+#[test]
+fn reseeds_need_qbittorrent_and_an_exact_save_path_allow_list() {
+    const PATHS: &str = "QBITTORRENT_RESEED_SAVE_PATHS";
+    const GATE: (&str, Option<&str>) = ("MEDIA_BROKER_ENABLE_RESEEDS", Some("true"));
+    let env = Env::new();
+    let loaded = env.load(&[]).unwrap();
+    assert!(!loaded.enable_reseeds && loaded.reseed_save_paths.is_empty());
+    let loaded = env.load(&[GATE, (PATHS, Some("/data/torrents/music/, /data/b"))]).unwrap();
+    assert!(loaded.enable_reseeds);
+    assert_eq!(loaded.reseed_save_paths, ["/data/torrents/music", "/data/b"]);
+    env.rejects(&[GATE], "must contain at least one value");
+    env.rejects(&[(PATHS, Some("/data/torrents/music"))], "requires MEDIA_BROKER_ENABLE_RESEEDS");
+    let no_qbit = [GATE, (PATHS, Some("/data")), ("QBITTORRENT_URL", None)];
+    let no_qbit = [&no_qbit[..], &[("QBITTORRENT_USERNAME", None)]].concat();
+    let no_qbit = [&no_qbit[..], &[("QBITTORRENT_PASSWORD_FILE", None)]].concat();
+    env.rejects(&no_qbit, "requires QBITTORRENT_URL");
+    env.rejects(&[("MEDIA_BROKER_ENABLE_RESEEDS", Some("on"))], "true or false");
+    for path in
+        ["data/torrents", "/", "//", "/data/../etc", "/data/./x", "/data//x", "/data/*", "/a\tb"]
+    {
+        env.rejects(&[GATE, (PATHS, Some(path))], "not an exact absolute directory");
+    }
+}

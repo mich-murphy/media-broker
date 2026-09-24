@@ -48,6 +48,7 @@ pub const REQUEST_TOOLS: [&str; 6] = [
 pub const DELETE_TOOL: &str = "arr_delete_media";
 pub const TORRENT_TOOLS: [&str; 3] =
     ["torrent_client_stats", "torrent_client_inventory", "torrent_client_check_paths"];
+pub const RESEED_TOOL: &str = "torrent_client_reseed";
 pub const QBIT_SID: &str = "qbit-test-session-id";
 pub const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -141,7 +142,11 @@ impl Broker {
             max_response_bytes: 2_000_000,
             enable_requests: false,
             enable_deletes: false,
+            enable_reseeds: false,
+            reseed_save_paths: Vec::new(),
             confirmation_ttl: Duration::from_secs(300),
+            reseed_poll_interval: Duration::from_millis(5),
+            reseed_deadline: Duration::from_secs(2),
         };
         configure(&mut settings);
         Self { app: server::router(settings), seen }

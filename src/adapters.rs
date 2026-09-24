@@ -1,22 +1,27 @@
 //! Small adapters with bounded responses and explicit projections.
 //!
 //! Read tools are available when their upstream is configured. Write tools
-//! (request, unmonitor, delete) are gated in the server; deletions
+//! (request, unmonitor, delete, reseed) are gated in the server; deletions
 //! additionally require a short-lived signed confirmation bound to the exact
-//! action parameters.
+//! action parameters, and reseeds only ever start a torrent whose data a full
+//! recheck verified.
 
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::{self, Write as _},
+    ops::Range,
+    time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, KeyInit, Mac};
 use jiff::{Timestamp, ToSpan, civil::Date};
 use reqwest::{Method, RequestBuilder, header::CONTENT_TYPE, redirect::Policy};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
@@ -28,6 +33,17 @@ const MAX_LIST_ENTRIES: usize = 16;
 const MAX_SEASON_ENTRIES: usize = 64;
 const MAX_REQUEST_BYTES: usize = 262_144;
 const MAX_HASHES: usize = 100;
+const MAX_BENCODE_DEPTH: usize = 64;
+/// The largest accepted metainfo file; a music album's is tens of kilobytes.
+pub const MAX_TORRENT_BYTES: usize = 1_048_576;
+/// Marks torrents this broker added, so a replay resumes only its own work.
+const RESEED_TAG: &str = "media-broker-reseed";
+/// Bytes per second; qBittorrent reads 0 as unlimited, so 1 is the floor. It
+/// keeps any block from completing in the window where libtorrent may start a
+/// torrent with no files on disk before qBittorrent stops it again.
+const RESEED_DOWNLOAD_LIMIT: &str = "1";
+/// qBittorrent's default state refresh interval, in milliseconds.
+const DEFAULT_REFRESH_MS: u64 = 1500;
 const DELETE_ACTION: &str = "arr_delete_media";
 // Tautulli 2.18.1 emits numeric quarter-step watched statuses; 1 is complete.
 const WATCHED_STATUSES: [f64; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
@@ -326,6 +342,8 @@ pub struct MediaClient {
     http: reqwest::Client,
     /// The qBittorrent session id, held server-side and never projected.
     qbit_sid: Mutex<Option<String>>,
+    /// Serializes reseeds so two calls never drive one torrent at once.
+    reseed: Mutex<()>,
 }
 
 impl MediaClient {
@@ -334,7 +352,7 @@ impl MediaClient {
     pub fn new(settings: Settings) -> Self {
         let builder = reqwest::Client::builder().redirect(Policy::none()).no_proxy();
         let http = builder.build().expect("the HTTP client initializes");
-        Self { settings, http, qbit_sid: Mutex::new(None) }
+        Self { settings, http, qbit_sid: Mutex::new(None), reseed: Mutex::new(()) }
     }
 
     /// Address one upstream path; credentials travel in headers, never the URL.
@@ -992,8 +1010,28 @@ impl MediaClient {
         Ok(sid)
     }
 
-    /// GET one qBittorrent path, re-authenticating exactly once on a 403.
+    /// GET one qBittorrent path.
     async fn qbit_fetch(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>> {
+        self.qbit_exchange(Method::GET, path, |request| request.query(query)).await
+    }
+
+    /// POST one broker-built form to a qBittorrent action.
+    async fn qbit_post(&self, path: &str, form: &[(&str, &str)]) -> Result<Vec<u8>> {
+        let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
+        let form = |request: RequestBuilder| {
+            request.header(CONTENT_TYPE, "application/x-www-form-urlencoded").body(body.clone())
+        };
+        self.qbit_exchange(Method::POST, path, form).await
+    }
+
+    /// One qBittorrent exchange, re-authenticating exactly once on a 403;
+    /// `build` completes the request afresh for each attempt.
+    async fn qbit_exchange(
+        &self,
+        method: Method,
+        path: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder,
+    ) -> Result<Vec<u8>> {
         for retried in [false, true] {
             let cached = self.qbit_sid.lock().await.clone();
             let sid = match cached {
@@ -1001,10 +1039,9 @@ impl MediaClient {
                 None => self.qbit_login().await?,
             };
             let request = self
-                .request(Service::Qbittorrent, Method::GET, path)?
-                .header(reqwest::header::COOKIE, format!("SID={sid}"))
-                .query(query);
-            let (status, body) = self.exchange(request).await?;
+                .request(Service::Qbittorrent, method.clone(), path)?
+                .header(reqwest::header::COOKIE, format!("SID={sid}"));
+            let (status, body) = self.exchange(build(request)).await?;
             if status == 403 && !retried {
                 *self.qbit_sid.lock().await = None;
                 continue;
@@ -1117,6 +1154,202 @@ impl MediaClient {
             "items": items,
         }))
     }
+
+    /// Fetch the one torrent with this id, if qBittorrent lists it.
+    async fn qbit_torrent(&self, hash: &str) -> Result<Option<Value>> {
+        let rows = self.qbit_torrents(&[("hashes", hash.to_owned())]).await?;
+        Ok(rows.into_iter().find(|row| text(&row["hash"]).is_some_and(|id| id == hash)))
+    }
+
+    /// Refuse client settings under which a recheck would change files on
+    /// disk, and return how long a state change takes to become visible.
+    async fn reseed_preflight(&self) -> Result<Duration> {
+        let preferences = self.qbit_json("/app/preferences", &[]).await?;
+        if !preferences.is_object() {
+            return upstream("upstream returned an unexpected preferences response");
+        }
+        let off = |name: &str| preferences[name].as_bool() == Some(false);
+        if !off("incomplete_files_ext") {
+            return parameter(
+                "qBittorrent appends an extension to incomplete files, so an incomplete recheck \
+                 would rename files on disk; disable it before reseeding",
+            );
+        }
+        if !off("excluded_file_names_enabled") && !off("use_unwanted_folder") {
+            return parameter(
+                "qBittorrent moves excluded files into an unwanted folder, which would move \
+                 files on disk; disable one of those settings before reseeding",
+            );
+        }
+        let refresh = preferences["refresh_interval"].as_u64().unwrap_or(DEFAULT_REFRESH_MS);
+        Ok(Duration::from_millis(refresh.min(30_000)) + self.settings.reseed_poll_interval)
+    }
+
+    /// Resolve the requested save path against the exact allow-list; a single
+    /// allowed path is the default.
+    fn reseed_save_path(&self, requested: Option<&str>) -> Result<&str> {
+        let allowed = &self.settings.reseed_save_paths;
+        match requested.map(|path| path.trim().trim_end_matches('/')) {
+            Some(wanted) => match allowed.iter().find(|path| *path == wanted) {
+                Some(path) => Ok(path),
+                None => parameter("save_path is not an allowed reseed save path"),
+            },
+            None if allowed.len() == 1 => Ok(&allowed[0]),
+            None => parameter("save_path is required when several reseed save paths are allowed"),
+        }
+    }
+
+    /// Add one metainfo file stopped, tagged, unchecked, and throttled, with
+    /// every client default that could move or reshape its files overridden.
+    async fn qbit_add(&self, metainfo: &[u8], hash: &str, save_path: &str) -> Result<()> {
+        let fields = [
+            ("savepath", save_path),
+            ("autoTMM", "false"),
+            ("useDownloadPath", "false"),
+            ("stopped", "true"),
+            ("stopCondition", "None"),
+            ("skip_checking", "false"),
+            ("contentLayout", "Original"),
+            ("tags", RESEED_TAG),
+            ("dlLimit", RESEED_DOWNLOAD_LIMIT),
+        ];
+        let mut boundary = format!("media-broker-{hash}");
+        while metainfo.windows(boundary.len()).any(|window| window == boundary.as_bytes()) {
+            boundary.push('-');
+        }
+        let mut body = Vec::with_capacity(metainfo.len() + 2048);
+        for (name, value) in fields {
+            let part = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            );
+            body.extend_from_slice(part.as_bytes());
+        }
+        let file = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"torrents\"; \
+             filename=\"{hash}.torrent\"\r\nContent-Type: application/x-bittorrent\r\n\r\n"
+        );
+        body.extend_from_slice(file.as_bytes());
+        body.extend_from_slice(metainfo);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let multipart = |request: RequestBuilder| {
+            request.header(CONTENT_TYPE, content_type.as_str()).body(body.clone())
+        };
+        let answer = self.qbit_exchange(Method::POST, "/torrents/add", multipart).await?;
+        // "Fails." covers duplicates and a client still starting up alike.
+        if answer.trim_ascii() != b"Ok." {
+            return upstream("upstream refused the torrent");
+        }
+        Ok(())
+    }
+
+    /// Poll one torrent until it leaves every checking state. A settled state
+    /// counts only after a check was seen or `settled_after`, because the
+    /// state qBittorrent reports lags a recheck by up to one refresh interval.
+    /// `Err` carries the last row seen when the deadline passed first.
+    async fn await_check(
+        &self,
+        hash: &str,
+        mut seen_checking: bool,
+        settled_after: Instant,
+        deadline: Instant,
+    ) -> Result<std::result::Result<Value, Value>> {
+        loop {
+            let Some(row) = self.qbit_torrent(hash).await? else {
+                return upstream("the torrent disappeared from the client during its recheck");
+            };
+            if phase(&row) == Phase::Checking {
+                seen_checking = true;
+            } else if seen_checking || Instant::now() >= settled_after {
+                return Ok(Ok(row));
+            }
+            let poll = self.settings.reseed_poll_interval;
+            if Instant::now() + poll > deadline {
+                return Ok(Err(row));
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// Re-add one v1 metainfo file over data already on disk and start seeding
+    /// only once a full recheck verifies every piece; otherwise remove it
+    /// again, keeping the data. Torrents this tool did not add are never
+    /// touched, so a whole batch can be replayed after any interruption.
+    pub async fn torrent_reseed(&self, torrent_b64: &str, save_path: Option<&str>) -> Result {
+        let Ok(metainfo) = BASE64.decode(torrent_b64.trim()) else {
+            return parameter("torrent_b64 must be standard base64");
+        };
+        if metainfo.len() > MAX_TORRENT_BYTES {
+            return parameter("torrent_b64 decodes to more than the 1 MiB metainfo limit");
+        }
+        let Some(hash) = info_hash(&metainfo) else {
+            return parameter(
+                "torrent_b64 must hold one well-formed v1 metainfo file; v2 and hybrid \
+                 torrents are not supported",
+            );
+        };
+        let save_path = self.reseed_save_path(save_path)?;
+        let _serial = self.reseed.lock().await;
+        let outcome = |outcome: &str, row: &Value| reseed_item(&hash, outcome, row);
+        let present = self.qbit_torrent(&hash).await?;
+        if let Some(row) = present.as_ref().filter(|row| !tagged(row)) {
+            return Ok(outcome("already_present", row));
+        }
+        let settle = self.reseed_preflight().await?;
+        let deadline = Instant::now() + self.settings.reseed_deadline;
+        let fresh = present.is_none();
+        let row = if let Some(row) = present {
+            row
+        } else {
+            self.qbit_add(&metainfo, &hash, save_path).await?;
+            // The add is asynchronous: the torrent is listed only once
+            // libtorrent has loaded it.
+            self.await_listed(&hash, deadline).await?
+        };
+        let checked = match phase(&row) {
+            Phase::Seeding if complete(&row) => return Ok(outcome("reseeding", &row)),
+            Phase::Seeding | Phase::Downloading => row,
+            Phase::Checking => match self.await_check(&hash, true, Instant::now(), deadline).await?
+            {
+                Ok(row) => row,
+                Err(last) => return Ok(outcome("checking", &last)),
+            },
+            // A stopped torrent from an earlier call was verified only if it
+            // is complete: nothing but a recheck raises its progress.
+            Phase::Settled if complete(&row) && !fresh => row,
+            Phase::Settled => {
+                self.qbit_post("/torrents/recheck", &[("hashes", &hash)]).await?;
+                let settled_after = Instant::now() + settle;
+                match self.await_check(&hash, false, settled_after, deadline).await? {
+                    Ok(row) => row,
+                    Err(last) => return Ok(outcome("checking", &last)),
+                }
+            }
+        };
+        if complete(&checked) {
+            if phase(&checked) != Phase::Seeding {
+                self.qbit_post("/torrents/start", &[("hashes", &hash)]).await?;
+            }
+            return Ok(outcome("reseeding", &checked));
+        }
+        let form = [("hashes", hash.as_str()), ("deleteFiles", "false")];
+        self.qbit_post("/torrents/delete", &form).await?;
+        Ok(outcome("aborted_incomplete", &checked))
+    }
+
+    /// Wait for a just-added torrent to be listed.
+    async fn await_listed(&self, hash: &str, deadline: Instant) -> Result {
+        loop {
+            if let Some(row) = self.qbit_torrent(hash).await? {
+                return Ok(row);
+            }
+            let poll = self.settings.reseed_poll_interval;
+            if Instant::now() + poll > deadline {
+                return upstream("the added torrent was not listed before the deadline");
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
 }
 
 /// qBittorrent session ids are short ASCII tokens; anything else is untrusted.
@@ -1154,4 +1387,129 @@ fn path_check_item(row: &Value) -> Value {
         "save_path": text(&row["save_path"]),
         "data_complete": progress.map(|progress| progress >= 1.0),
     })
+}
+
+/// Where a torrent stands for a reseed, from qBittorrent 5.1's state string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Hashing, queued for a check slot, or moving storage.
+    Checking,
+    /// Running with the client's recorded data complete.
+    Seeding,
+    /// Running while incomplete: removed at once, never left to download.
+    Downloading,
+    /// Stopped, errored, missing files, or unknown.
+    Settled,
+}
+
+fn phase(row: &Value) -> Phase {
+    match row["state"].as_str().unwrap_or_default() {
+        "checkingUP" | "checkingDL" | "checkingResumeData" | "moving" => Phase::Checking,
+        "uploading" | "stalledUP" | "queuedUP" | "forcedUP" => Phase::Seeding,
+        "downloading" | "stalledDL" | "queuedDL" | "forcedDL" | "metaDL" | "forcedMetaDL" => {
+            Phase::Downloading
+        }
+        _ => Phase::Settled,
+    }
+}
+
+/// Every piece of every file verified: full progress, nothing left, and no
+/// file excluded from the wanted size.
+fn complete(row: &Value) -> bool {
+    let size = row["size"].as_i64();
+    row["progress"].as_f64().is_some_and(|progress| progress >= 1.0)
+        && row["amount_left"].as_i64() == Some(0)
+        && size.is_some_and(|size| size > 0)
+        && size == row["total_size"].as_i64()
+}
+
+/// Whether this broker added the torrent; qBittorrent joins tags with ", ".
+fn tagged(row: &Value) -> bool {
+    text(&row["tags"]).is_some_and(|tags| tags.split(',').any(|tag| tag.trim() == RESEED_TAG))
+}
+
+/// Project one reseed outcome with the fields a batch report needs.
+fn reseed_item(hash: &str, outcome: &str, row: &Value) -> Value {
+    json!({
+        "service": "qbittorrent",
+        "hash": hash,
+        "outcome": outcome,
+        "name": text(&row["name"]),
+        "state": text(&row["state"]),
+        "progress": row["progress"].as_number(),
+        "size_bytes": row["total_size"].as_i64(),
+        "amount_left_bytes": row["amount_left"].as_i64(),
+        "save_path": text(&row["save_path"]),
+    })
+}
+
+/// The end offset of the bencoded value starting at `at`, or `None` when it
+/// is malformed, truncated, or nested deeper than [`MAX_BENCODE_DEPTH`].
+fn bencode_end(data: &[u8], at: usize, depth: usize) -> Option<usize> {
+    match *data.get(at)? {
+        b'i' => {
+            let end = at + 1 + data.get(at + 1..)?.iter().position(|&byte| byte == b'e')?;
+            let digits = data[at + 1..end].strip_prefix(b"-").unwrap_or(&data[at + 1..end]);
+            let valid = !digits.is_empty() && digits.iter().all(u8::is_ascii_digit);
+            valid.then_some(end + 1)
+        }
+        b'l' | b'd' if depth < MAX_BENCODE_DEPTH => {
+            let dictionary = data[at] == b'd';
+            let mut next = at + 1;
+            while *data.get(next)? != b'e' {
+                // Dictionary keys are byte strings, each followed by its value.
+                if dictionary {
+                    data[next].is_ascii_digit().then_some(())?;
+                    next = bencode_end(data, next, depth + 1)?;
+                }
+                next = bencode_end(data, next, depth + 1)?;
+            }
+            Some(next + 1)
+        }
+        b'0'..=b'9' => {
+            let colon = at + data[at..].iter().position(|&byte| byte == b':')?;
+            let length: usize = std::str::from_utf8(&data[at..colon]).ok()?.parse().ok()?;
+            let end = colon.checked_add(1)?.checked_add(length)?;
+            (end <= data.len()).then_some(end)
+        }
+        _ => None,
+    }
+}
+
+/// One dictionary entry: the raw key and the byte range of its value.
+type Entry<'a> = (&'a [u8], Range<usize>);
+
+/// The entries of the bencoded dictionary starting at `at`, plus the
+/// dictionary's end offset.
+fn bencode_entries(data: &[u8], at: usize) -> Option<(Vec<Entry<'_>>, usize)> {
+    (*data.get(at)? == b'd').then_some(())?;
+    let mut entries = Vec::new();
+    let mut next = at + 1;
+    while *data.get(next)? != b'e' {
+        let key_end = data[next].is_ascii_digit().then(|| bencode_end(data, next, 1))??;
+        let colon = next + data[next..key_end].iter().position(|&byte| byte == b':')?;
+        let value_end = bencode_end(data, key_end, 1)?;
+        entries.push((&data[colon + 1..key_end], key_end..value_end));
+        next = value_end;
+    }
+    Some((entries, next + 1))
+}
+
+/// The lowercase hex v1 info-hash of one metainfo file: SHA-1 over the exact
+/// bytes of its `info` dictionary, which must carry v1 `pieces`. Anything but
+/// a single well-formed top-level dictionary is refused.
+fn info_hash(metainfo: &[u8]) -> Option<String> {
+    let (entries, end) = bencode_entries(metainfo, 0)?;
+    (end == metainfo.len()).then_some(())?;
+    let (_, info) = entries.into_iter().find(|(key, _)| *key == b"info")?;
+    let (fields, _) = bencode_entries(metainfo, info.start)?;
+    // qBittorrent identifies v2 and hybrid torrents by their truncated v2
+    // hash, so only pure v1 metainfo has an id this function can compute.
+    let has = |name: &[u8]| fields.iter().any(|(key, _)| *key == name);
+    (has(b"pieces") && !has(b"meta version")).then_some(())?;
+    let mut hex = String::with_capacity(40);
+    for byte in Sha1::digest(&metainfo[info]) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
 }
