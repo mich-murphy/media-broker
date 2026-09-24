@@ -49,7 +49,9 @@ pub const DELETE_TOOL: &str = "arr_delete_media";
 pub const TORRENT_TOOLS: [&str; 3] =
     ["torrent_client_stats", "torrent_client_inventory", "torrent_client_check_paths"];
 pub const RESEED_TOOL: &str = "torrent_client_reseed";
-pub const QBIT_SID: &str = "qbit-test-session-id";
+/// Shaped like a qBittorrent 5.1 session id: standard base64 of 24 random
+/// bytes, so it can hold `+` and `/`.
+pub const QBIT_SID: &str = "q3Hk+3vN/pX2mR8tL0wYc5Ze9aJbFs1G";
 pub const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 pub const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 

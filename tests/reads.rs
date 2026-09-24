@@ -770,6 +770,24 @@ async fn torrent_session_failures_are_sanitized() {
 }
 
 #[tokio::test]
+async fn an_accepted_login_without_a_usable_session_cookie_is_named_as_such() {
+    // A renamed cookie (WebAPI\SessionCookieName), a value outside the RFC
+    // 6265 cookie octets, and no cookie at all.
+    for cookie in [Some("QBT_SID=abc; path=/"), Some("SID=abc,def; path=/"), None] {
+        let login = move |_: &Seen| {
+            let response = cookie.into_iter().fold(Response::builder(), |response, cookie| {
+                response.header("set-cookie", cookie)
+            });
+            response.body(Body::from("Ok.")).unwrap()
+        };
+        let broker = Broker::configured(with_qbit, login).await;
+        let error = broker.err("torrent_client_stats", json!({})).await;
+        assert!(error.contains("no usable session cookie"), "{cookie:?}: {error}");
+        assert_eq!(broker.seen().len(), 1, "only the login: {:?}", broker.seen());
+    }
+}
+
+#[tokio::test]
 async fn tools_for_unconfigured_upstreams_are_clear_parameter_errors() {
     // Radarr stays configured so the arr gate keeps the tools registered;
     // addressing a removed service must fail before any upstream call.

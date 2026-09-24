@@ -1002,9 +1002,11 @@ impl MediaClient {
         let deadline = tokio::time::timeout(self.settings.timeout, attempt);
         let (status, sid, body) =
             deadline.await.unwrap_or_else(|_| upstream("upstream request timed out"))?;
-        let accepted = status < 300 && body.trim_ascii() == b"Ok.";
-        let Some(sid) = sid.filter(|_| accepted) else {
+        if status >= 300 || body.trim_ascii() != b"Ok." {
             return upstream("upstream authentication failed");
+        }
+        let Some(sid) = sid else {
+            return upstream("upstream login returned no usable session cookie");
         };
         *self.qbit_sid.lock().await = Some(sid.clone());
         Ok(sid)
@@ -1352,10 +1354,12 @@ impl MediaClient {
     }
 }
 
-/// qBittorrent session ids are short ASCII tokens; anything else is untrusted.
+/// qBittorrent session ids are standard base64, so `+` and `/` are routine.
+/// Any bounded run of RFC 6265 cookie octets (visible ASCII except `"`, `,`,
+/// `;`, and `\`) is accepted; nothing else can end or extend the cookie.
 fn valid_sid(sid: &str) -> bool {
-    let token = sid.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte));
-    !sid.is_empty() && sid.len() <= 256 && token
+    let octet = |byte: u8| byte.is_ascii_graphic() && !b"\",;\\".contains(&byte);
+    !sid.is_empty() && sid.len() <= 256 && sid.bytes().all(octet)
 }
 
 /// Project one torrent row to its allow-listed swarm fields.
