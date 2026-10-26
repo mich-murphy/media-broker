@@ -14,7 +14,7 @@ RUN touch src/lib.rs src/main.rs \
     && cargo build --release --locked
 
 # The runtime image carries only the binary: no toolchain, cargo, or source tree.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 
 COPY --from=build /app/target/release/media-broker /usr/local/bin/media-broker
 USER 65532:65532
